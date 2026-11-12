@@ -16,12 +16,12 @@ separate user-partition blocks.
 
 Install PSPSDK, intraFont, and the VME-capable Media Engine library pinned in
 [the workflow](../.github/workflows/psp-build.yml). Host tools include GNU Make,
-Python 3 with PyYAML, and MIPS binutils. A normal PSP build requires no ROM,
-extraction tree, or `make setup`:
+Python 3 with PyYAML and colorama, and MIPS binutils. A normal PSP build requires
+no ROM, extraction tree, or `make setup`:
 
 ```sh
 python3 -m venv .venv
-.venv/bin/python3 -m pip install 'PyYAML>=6.0.1,<7.0.0'
+.venv/bin/python3 -m pip install 'PyYAML>=6.0.1,<7.0.0' 'colorama>=0.4.3'
 ./psp.sh VERSION=n64-us
 python3 tools/package_psp.py build/psp-port/n64-us build/mm-psp-n64-us.zip
 ```
@@ -89,8 +89,11 @@ The shortened foreground camera plane preserves the original fog curve and
 first-person model-selection threshold.
 Normal cutscenes retain MM's original near plane for depth precision. Texture
 sampler modes are restored when returning from fused materials to cached tree
-layers and shadows. Motion blur restarts each GU list on the active draw buffer,
-uses unlit sprites, and refreshes its history texture before sampling it.
+layers and shadows. Motion blur blends history with unlit 32-pixel sprite strips
+and captures the blended scene before the HUD with a GE image transfer in the
+same command list. The history buffer stays GPU-owned after initialization;
+normal blur frames need no CPU framebuffer copy, cache writeback, or extra CPU
+wait for the GE. List exhaustion still fences before reusing command storage.
 Clock Town's wrapped tile bounds use 12-bit extents consistently for imports,
 mirroring, and both layers' UVs. Scrolling across zero keeps the same texture
 dimensions and allocation.
@@ -142,7 +145,10 @@ asset builder with raw, Yaz0, and MM's zero-filled symbol-only segments. Synthet
 ROM fixtures also check temporary-file cleanup after failed extraction. The tests
 also cover file-select save completion, two-second deadlines, owl backup writes,
 blur across rotating framebuffers, and sampler restoration after material/effect
-changes. Clock Town wall tests sweep both tiles across the complete coordinate
+changes. Blur tests queue scene, blend, capture, and HUD commands to check feedback
+pixels, 16/32-bit LCD/TV output, narrow viewports, history resets, texture/transfer
+ordering, state restoration, and list rollover without normal-path CPU waits.
+Clock Town wall tests sweep both tiles across the complete coordinate
 wrap and compare scrolling combined-material pixels. Material-transition tests
 also cover secondary uploads, cache hits, mutable images, GPU shadow imports,
 and cached draw bindings after uploads. Shader lifecycle tests run the real

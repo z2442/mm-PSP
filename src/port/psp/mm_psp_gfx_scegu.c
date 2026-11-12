@@ -19,6 +19,10 @@ typedef struct MmPspMotionBlurVertex {
     uint16_t z;
 } __attribute__((aligned(4))) MmPspMotionBlurVertex;
 
+/* Narrow sprites keep linear framebuffer reads friendly to the GE texture
+ * cache. Batch all slices sharing a texture image into a single draw. */
+#define MM_PSP_MOTION_BLUR_SLICE_WIDTH 32
+
 static void* sMmPspMotionBlurBuffer;
 static size_t sMmPspMotionBlurBufferSize;
 static bool sMmPspMotionBlurValid;
@@ -61,7 +65,9 @@ static bool MmPspGfx_EnsureMotionBlurBuffer(void) {
 
     sMmPspMotionBlurBufferSize = size;
     memset(sMmPspMotionBlurBuffer, 0, size);
-    sceKernelDcacheWritebackRange(sMmPspMotionBlurBuffer, size);
+    /* Publish the padding once, then leave history entirely GE-owned. Dirty
+     * CPU cache lines must never overwrite subsequent GPU captures. */
+    sceKernelDcacheWritebackInvalidateRange(sMmPspMotionBlurBuffer, size);
     printf("mm-psp motion blur storage addr=%p size=%lu\n", sMmPspMotionBlurBuffer,
            (unsigned long)size);
     return true;
@@ -82,8 +88,14 @@ static void MmPspGfx_RecordMotionBlurGeometry(void) {
 }
 
 static void MmPspGfx_CaptureMotionBlurFrame(void) {
-    gfx_scegu_copy_framebuffer_from_vram(sMmPspMotionBlurBuffer, sDrawBuffer);
-    sceKernelDcacheWritebackRange(sMmPspMotionBlurBuffer, FRAMEBUFFER_SIZE);
+    /* Keep capture after scene/blend commands and before the HUD in the same
+     * list. Use the full VRAM address: sDrawBuffer may be a relative GU pointer.
+     * Copy visible columns only; framebuffer stride padding is never sampled. */
+    sceGuTexSync();
+    sceGuCopyImage(sColorPixelFormat, 0, 0, SCR_WIDTH, SCR_HEIGHT, BUF_WIDTH,
+                   gfx_scegu_vram_cpu_addr(sDrawBuffer), 0, 0, BUF_WIDTH, sMmPspMotionBlurBuffer);
+    sceGuTexSync();
+    sceGuTexFlush();
 }
 
 static void MmPspGfx_DrawMotionBlurHistory(uint8_t alpha) {
@@ -108,9 +120,8 @@ static void MmPspGfx_DrawMotionBlurHistory(uint8_t alpha) {
     originY = (SCR_HEIGHT - viewportHeight) / 2;
     color = ((uint32_t)alpha << 24) | 0x00FFFFFFU;
 
-    /* The GU accepts textures up to 512 pixels wide.  LCD is one strip; the
-     * 720-wide TV framebuffer uses a 512-pixel and a 256-pixel strip. */
-    gfx_scegu_start_list();
+    /* The GU accepts textures up to 512 pixels wide. LCD uses one image;
+     * the 720-wide TV framebuffer uses 512-pixel and 256-pixel images. */
     gfx_scegu_set_lighting(NULL);
     sceGuPixelMask(0);
     sceGuDisable(GU_DEPTH_TEST);
@@ -139,43 +150,50 @@ static void MmPspGfx_DrawMotionBlurHistory(uint8_t alpha) {
         const int textureHeight = nextpow2(SCR_HEIGHT);
         const size_t pixelOffset = (size_t)tileStart * (size_t)sColorPixelSize;
         MmPspMotionBlurVertex* vertices;
+        int vertexCount;
+        int sliceStart;
+        int i;
 
         if (drawRight <= drawLeft) {
             continue;
         }
 
-        vertices = (MmPspMotionBlurVertex*)sceGuGetMemory(sizeof(*vertices) * 2);
-        vertices[0].u = (uint16_t)(drawLeft - tileStart);
-        vertices[0].v = (uint16_t)originY;
-        vertices[0].color = color;
-        vertices[0].x = (uint16_t)drawLeft;
-        vertices[0].y = (uint16_t)originY;
-        vertices[0].z = 0;
-        vertices[1].u = (uint16_t)(drawRight - tileStart);
-        vertices[1].v = (uint16_t)(originY + viewportHeight);
-        vertices[1].color = color;
-        vertices[1].x = (uint16_t)drawRight;
-        vertices[1].y = (uint16_t)(originY + viewportHeight);
-        vertices[1].z = 0;
+        vertexCount = ((drawRight - drawLeft + MM_PSP_MOTION_BLUR_SLICE_WIDTH - 1) /
+                       MM_PSP_MOTION_BLUR_SLICE_WIDTH) * 2;
+        vertices = (MmPspMotionBlurVertex*)sceGuGetMemory(sizeof(*vertices) * vertexCount);
+        for (sliceStart = drawLeft, i = 0; sliceStart < drawRight;
+             sliceStart += MM_PSP_MOTION_BLUR_SLICE_WIDTH, i += 2) {
+            const int sliceRight = (sliceStart + MM_PSP_MOTION_BLUR_SLICE_WIDTH < drawRight)
+                                       ? sliceStart + MM_PSP_MOTION_BLUR_SLICE_WIDTH : drawRight;
+
+            vertices[i].u = (uint16_t)(sliceStart - tileStart);
+            vertices[i].v = (uint16_t)originY;
+            vertices[i].color = color;
+            vertices[i].x = (uint16_t)sliceStart;
+            vertices[i].y = (uint16_t)originY;
+            vertices[i].z = 0;
+            vertices[i + 1].u = (uint16_t)(sliceRight - tileStart);
+            vertices[i + 1].v = (uint16_t)(originY + viewportHeight);
+            vertices[i + 1].color = color;
+            vertices[i + 1].x = (uint16_t)sliceRight;
+            vertices[i + 1].y = (uint16_t)(originY + viewportHeight);
+            vertices[i + 1].z = 0;
+        }
 
         sceGuTexImage(0, tileWidth, textureHeight, BUF_WIDTH,
                       (uint8_t*)sMmPspMotionBlurBuffer + pixelOffset);
         sceGuDrawArray(GU_SPRITES,
                        GU_TEXTURE_16BIT | GU_COLOR_8888 | GU_VERTEX_16BIT | GU_TRANSFORM_2D,
-                       2, NULL, vertices);
+                       vertexCount, NULL, vertices);
     }
-
-    sceGuFinish();
-    sceGuSync(GU_SYNC_FINISH, GU_SYNC_WHAT_DONE);
 
     /* Preserve MM's feedback behavior: the blended output, rather than only
      * the unblurred scene, is the history texture for the following frame. */
     MmPspGfx_CaptureMotionBlurFrame();
 
     /* Continue the original display list with the renderer state it had at
-     * the marker.  Rebinding is required because the history strips bypassed
+     * the marker. Rebinding is required because the history images bypassed
      * the normal texture manager. */
-    gfx_scegu_start_list();
     sceGuDepthFunc(GU_GEQUAL);
     if (sDepthTestEnabled) {
         sceGuEnable(GU_DEPTH_TEST);
@@ -183,7 +201,7 @@ static void MmPspGfx_DrawMotionBlurHistory(uint8_t alpha) {
         sceGuDisable(GU_DEPTH_TEST);
     }
     sceGuDepthMask(sDepthWriteEnabled ? GU_FALSE : GU_TRUE);
-    sceGuScissor(originX, originY, originX + viewportWidth, originY + viewportHeight);
+    sceGuScissor(sScissorBounds[0], sScissorBounds[1], sScissorBounds[2], sScissorBounds[3]);
     sceGuEnable(GU_SCISSOR_TEST);
     sceGuTexEnvColor(sTextureEnvColor);
     sceGuTexOffset(0.0f, 0.0f);
@@ -220,20 +238,14 @@ static void MmPspGfx_ApplyMotionBlur(uint8_t alpha, bool resetHistory) {
         sMmPspMotionBlurValid = false;
     }
 
-    /* Complete all scene commands before sampling or copying the draw buffer. */
-    sceGuFinish();
-    sceGuSync(GU_SYNC_FINISH, GU_SYNC_WHAT_DONE);
+    /* Reserve the entire effect before emitting any of it. Only list exhaustion
+     * needs a CPU fence; normal blur frames stay in the current command list. */
+    gfx_scegu_reserve_list_memory(((SCR_WIDTH + MM_PSP_MOTION_BLUR_SLICE_WIDTH - 1) /
+                                 MM_PSP_MOTION_BLUR_SLICE_WIDTH) * 2 * sizeof(MmPspMotionBlurVertex));
 
-    if (!sMmPspMotionBlurValid) {
+    if (!sMmPspMotionBlurValid || (alpha == 0)) {
         MmPspGfx_CaptureMotionBlurFrame();
         sMmPspMotionBlurValid = true;
-        gfx_scegu_start_list();
-        return;
-    }
-
-    if (alpha == 0) {
-        MmPspGfx_CaptureMotionBlurFrame();
-        gfx_scegu_start_list();
         return;
     }
 

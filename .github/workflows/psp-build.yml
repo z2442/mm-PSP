@@ -62,12 +62,12 @@ jobs:
           cmake --build "${RUNNER_TEMP}/me-core/build" --parallel "$(nproc)"
           cmake --install "${RUNNER_TEMP}/me-core/build"
 
-      - name: Install Python build dependency
+      - name: Install Python build dependencies
         shell: bash
         run: |
           python3 -m venv .venv
-          # The ROM-independent PSP build only needs PyYAML from requirements.txt.
-          .venv/bin/python3 -m pip install 'PyYAML>=6.0.1,<7.0.0'
+          # The ROM-independent PSP build needs PyYAML and colorama for schc.py.
+          .venv/bin/python3 -m pip install 'PyYAML>=6.0.1,<7.0.0' 'colorama>=0.4.3'
 
       - name: Build with psp.sh
         shell: bash

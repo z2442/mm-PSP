@@ -56,6 +56,10 @@ void Sched_SendNotifyMsg(Scheduler* sched);
 void Sched_SendAudioCancelMsg(Scheduler* sched);
 void Sched_SendGfxCancelMsg(Scheduler* sched);
 
+#if defined(TARGET_PSP)
+void SchedPsp_ResetGfxPacing(void);
+#endif
+
 void Sched_Init(Scheduler* sched, void* stack, OSPri pri, u8 viModeType, UNK_TYPE arg4, IrqMgr* irqMgr);
 
 extern Scheduler gScheduler;

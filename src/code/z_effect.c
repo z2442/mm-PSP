@@ -1,3 +1,6 @@
+#if PLATFORM_PSP
+#include "oot_psp_frame_interpolation.h"
+#endif
 #include "z64effect.h"
 #include "global.h"
 
@@ -223,6 +226,9 @@ void Effect_Add(PlayState* play, s32* pIndex, EffectType type, u8 arg3, u8 arg4,
         }
 
         if (slotFound) {
+#if PLATFORM_PSP
+            OotPspFrameInterpolation_ForgetIdentity(effect);
+#endif
             sEffectInfoTable[type].init(effect, initParams);
             status->unk2 = arg3;
             status->unk1 = arg4;
@@ -238,6 +244,10 @@ void Effect_DrawAll(GraphicsContext* gfxCtx) {
         if (!sEffectContext.sparks[i].status.active) {
             continue;
         }
+
+#if PLATFORM_PSP
+        OotPspFrameInterpolation_SetIdentity(&sEffectContext.sparks[i].effect);
+#endif
         sEffectInfoTable[EFFECT_SPARK].draw(&sEffectContext.sparks[i].effect, gfxCtx);
     }
 
@@ -245,6 +255,10 @@ void Effect_DrawAll(GraphicsContext* gfxCtx) {
         if (!sEffectContext.blures[i].status.active) {
             continue;
         }
+
+#if PLATFORM_PSP
+        OotPspFrameInterpolation_SetIdentity(&sEffectContext.blures[i].effect);
+#endif
         sEffectInfoTable[EFFECT_BLURE1].draw(&sEffectContext.blures[i].effect, gfxCtx);
     }
 
@@ -252,6 +266,10 @@ void Effect_DrawAll(GraphicsContext* gfxCtx) {
         if (!sEffectContext.shieldParticles[i].status.active) {
             continue;
         }
+
+#if PLATFORM_PSP
+        OotPspFrameInterpolation_SetIdentity(&sEffectContext.shieldParticles[i].effect);
+#endif
         sEffectInfoTable[EFFECT_SHIELD_PARTICLE].draw(&sEffectContext.shieldParticles[i].effect, gfxCtx);
     }
 
@@ -259,8 +277,15 @@ void Effect_DrawAll(GraphicsContext* gfxCtx) {
         if (!sEffectContext.tireMarks[i].status.active) {
             continue;
         }
+
+#if PLATFORM_PSP
+        OotPspFrameInterpolation_SetIdentity(&sEffectContext.tireMarks[i].effect);
+#endif
         sEffectInfoTable[EFFECT_TIRE_MARK].draw(&sEffectContext.tireMarks[i].effect, gfxCtx);
     }
+#if PLATFORM_PSP
+    OotPspFrameInterpolation_SetIdentity(NULL);
+#endif
 }
 
 void Effect_UpdateAll(PlayState* play) {

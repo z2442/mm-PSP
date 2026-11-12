@@ -708,7 +708,10 @@ OSTime osGetTime(void) {
     u64 ticks = 0;
 
     sceRtcGetCurrentTick(&ticks);
-    return ticks;
+    /* Game deadlines use the N64 counter's 46.875 MHz units. Split the RTC
+     * timestamp before scaling: its epoch in microseconds overflows a direct
+     * OS_USEC_TO_CYCLES multiplication, even though the result fits in u64. */
+    return (ticks / 1000000ULL) * OS_CPU_COUNTER + OS_USEC_TO_CYCLES(ticks % 1000000ULL);
 }
 
 void osSetTime(UNUSED OSTime time) {

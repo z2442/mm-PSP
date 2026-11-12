@@ -31,7 +31,7 @@
 #define MM_PSP_FLASH_SIZE 0x20000U
 #define MM_PSP_SAVE_IO_CHUNK_SIZE 0x4000U
 #define MM_PSP_ASSET_CACHE_BLOCK_COUNT 16
-#define MM_PSP_RENDERER_BLOCK_COUNT 4
+#define MM_PSP_RENDERER_BLOCK_COUNT 8
 
 typedef struct MmPspAssetCacheBlock {
     void* address;
@@ -86,6 +86,7 @@ static MmPspAssetCacheBlock sMmPspAssetCacheBlocks[MM_PSP_ASSET_CACHE_BLOCK_COUN
 static u8 sMmPspFlash[MM_PSP_FLASH_SIZE] __attribute__((aligned(64)));
 static s32 sMmPspFlashInitialized;
 static s32 sMmPspFlashAsyncResult;
+static s32 sMmPspFlashResultPending;
 
 static SceUID sMmPspStackThreadId = -1;
 static uintptr_t sMmPspStackStart;
@@ -623,23 +624,32 @@ void SysFlashrom_WriteAsync(void* addr, u32 pageNum, u32 pageCount) {
     size_t size = (size_t)pageCount * FLASH_BLOCK_SIZE;
 
     sMmPspFlashAsyncResult = -1;
+    sMmPspFlashResultPending = false;
     if (sMmPspFlashInitialized && (addr != NULL) && (offset <= sizeof(sMmPspFlash)) &&
         (size <= sizeof(sMmPspFlash) - offset)) {
         memcpy(&sMmPspFlash[offset], addr, size);
         sMmPspFlashAsyncResult = MmPsp_FlushFlash();
     }
+    sMmPspFlashResultPending = sMmPspFlashInitialized;
 }
 
 s32 SysFlashrom_IsBusy(void) {
-    return false;
+    /* Despite its name, MM uses this as "the result queue is full". Our
+     * file write finishes inline, but the caller must still collect it. */
+    return sMmPspFlashInitialized ? sMmPspFlashResultPending : -1;
 }
 
 s32 SysFlashrom_AwaitResult(void) {
+    if (!sMmPspFlashInitialized || !sMmPspFlashResultPending) {
+        return -1;
+    }
+    sMmPspFlashResultPending = false;
     return sMmPspFlashAsyncResult;
 }
 
 void SysFlashrom_WriteSync(void* addr, u32 pageNum, u32 pageCount) {
     SysFlashrom_WriteAsync(addr, pageNum, pageCount);
+    (void)SysFlashrom_AwaitResult();
 }
 
 void IrqMgr_AddClient(IrqMgr* irqMgr, IrqMgrClient* client, OSMesgQueue* msgQueue) {
@@ -826,8 +836,8 @@ void* MmPspRenderer_Memalign(size_t alignment, size_t size) {
 }
 
 /* OoT normally gives newlib nearly all remaining RAM, and its shared asset
- * loader allocates whole pinned assets from that heap. MM keeps newlib at
- * 64 KiB for reliable raw-PRX startup, so back those cache malloc/free calls
+ * loader allocates whole pinned assets from that heap. MM reserves a small newlib
+ * bootstrap heap for firmware fonts, so back those cache malloc/free calls
  * with ordinary user-partition blocks instead. In particular, MM's 5.3 MiB
  * Audiotable cannot fit in the PSP's 4 MiB volatile partition fallback. */
 void* MmPspAssetCache_Malloc(size_t size) {

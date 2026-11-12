@@ -1,3 +1,7 @@
+#if PLATFORM_PSP
+#include "oot_psp_frame_interpolation.h"
+#include "oot_psp_vfpu_matrix.h"
+#endif
 /**
  * @file sys_matrix.c
  * @brief: Matrix system that mostly uses a matrix stack, and concerns affine transformations.
@@ -999,6 +1003,18 @@ void Matrix_TranslateRotateZYX(Vec3f* translation, Vec3s* rot) {
     f32 temp1;
     f32 temp2;
 
+#if PLATFORM_PSP
+    f32 angles[6] = { sin, cos };
+    if (rot->y != 0) {
+        angles[2] = Math_SinS(rot->y);
+        angles[3] = Math_CosS(rot->y);
+    }
+    if (rot->x != 0) {
+        angles[4] = Math_SinS(rot->x);
+        angles[5] = Math_CosS(rot->x);
+    }
+    OotPspVfpu_MtxFTranslateRotateZYX(cmf, translation, angles, rot->y != 0, rot->x != 0);
+#else
     // No check for z != 0, presumably since translation is interleaved.
     temp1 = cmf->xx;
     temp2 = cmf->xy;
@@ -1073,6 +1089,7 @@ void Matrix_TranslateRotateZYX(Vec3f* translation, Vec3s* rot) {
         cmf->wy = temp1 * cos + temp2 * sin;
         cmf->wz = temp2 * cos - temp1 * sin;
     }
+#endif
 }
 
 /**
@@ -1157,6 +1174,9 @@ void Matrix_SetTranslateRotateYXZ(f32 x, f32 y, f32 z, Vec3s* rot) {
  * @remark original name: "_MtxF_to_Mtx"
  */
 Mtx* Matrix_MtxFToMtx(MtxF* src, Mtx* dest) {
+#if PLATFORM_PSP
+    OotPspFrameInterpolation_Record(dest, src->mf, __builtin_return_address(0));
+#endif
 #if defined(TARGET_PSP) || defined(PLATFORM_PSP)
     /*
      * The original halfword stores rely on the N64's big-endian Mtx layout.
@@ -1264,7 +1284,13 @@ Mtx* Matrix_ToMtx(Mtx* dest) {
  * @remark original name: "_Matrix_to_Mtx_new"
  */
 Mtx* Matrix_Finalize(GraphicsContext* gfxCtx) {
+#if PLATFORM_PSP
+    Mtx* result = Matrix_ToMtx(GRAPH_ALLOC(gfxCtx, sizeof(Mtx)));
+    OotPspFrameInterpolation_Record(result, sCurrentMatrix->mf, __builtin_return_address(0));
+    return result;
+#else
     return Matrix_ToMtx(GRAPH_ALLOC(gfxCtx, sizeof(Mtx)));
+#endif
 }
 
 // Unused

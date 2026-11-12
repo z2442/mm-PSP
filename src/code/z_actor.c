@@ -1,3 +1,6 @@
+#if PLATFORM_PSP
+#include "oot_psp_frame_interpolation.h"
+#endif
 /*
  * File: z_actor.c
  * Description:
@@ -1175,6 +1178,9 @@ void Actor_Init(Actor* actor, PlayState* play) {
 }
 
 void Actor_Destroy(Actor* actor, PlayState* play) {
+#if PLATFORM_PSP
+    OotPspFrameInterpolation_ForgetIdentity(actor);
+#endif
     if (actor->init == NULL) {
         if (actor->destroy != NULL) {
             actor->destroy(actor, play);
@@ -2767,6 +2773,9 @@ void Actor_UpdateAll(PlayState* play, ActorContext* actorCtx) {
 void Actor_Draw(PlayState* play, Actor* actor) {
     Lights* light;
 
+#if PLATFORM_PSP
+    OotPspFrameInterpolation_SetIdentity(actor);
+#endif
     OPEN_DISPS(play->state.gfxCtx);
 
     light = LightContext_NewLights(&play->lightCtx, play->state.gfxCtx);
@@ -2838,6 +2847,9 @@ void Actor_Draw(PlayState* play, Actor* actor) {
     actor->isDrawn = true;
 
     CLOSE_DISPS(play->state.gfxCtx);
+#if PLATFORM_PSP
+    OotPspFrameInterpolation_SetIdentity(NULL);
+#endif
 }
 
 void Actor_UpdateFlaggedAudio(Actor* actor) {

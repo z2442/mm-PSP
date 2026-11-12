@@ -110,7 +110,8 @@ static void MmPspGfx_DrawMotionBlurHistory(uint8_t alpha) {
 
     /* The GU accepts textures up to 512 pixels wide.  LCD is one strip; the
      * 720-wide TV framebuffer uses a 512-pixel and a 256-pixel strip. */
-    sceGuStart(GU_DIRECT, list);
+    gfx_scegu_start_list();
+    gfx_scegu_set_lighting(NULL);
     sceGuPixelMask(0);
     sceGuDisable(GU_DEPTH_TEST);
     sceGuDepthMask(GU_TRUE);
@@ -126,6 +127,7 @@ static void MmPspGfx_DrawMotionBlurHistory(uint8_t alpha) {
     sceGuTexWrap(GU_CLAMP, GU_CLAMP);
     sceGuTexOffset(0.0f, 0.0f);
     sceGuTexScale(1.0f, 1.0f);
+    sceGuTexFlush();
 
     texman_invalidate_binding();
     for (tileStart = 0; tileStart < SCR_WIDTH; tileStart += 512) {
@@ -173,7 +175,7 @@ static void MmPspGfx_DrawMotionBlurHistory(uint8_t alpha) {
     /* Continue the original display list with the renderer state it had at
      * the marker.  Rebinding is required because the history strips bypassed
      * the normal texture manager. */
-    sceGuStart(GU_DIRECT, list);
+    gfx_scegu_start_list();
     sceGuDepthFunc(GU_GEQUAL);
     if (sDepthTestEnabled) {
         sceGuEnable(GU_DEPTH_TEST);
@@ -225,13 +227,13 @@ static void MmPspGfx_ApplyMotionBlur(uint8_t alpha, bool resetHistory) {
     if (!sMmPspMotionBlurValid) {
         MmPspGfx_CaptureMotionBlurFrame();
         sMmPspMotionBlurValid = true;
-        sceGuStart(GU_DIRECT, list);
+        gfx_scegu_start_list();
         return;
     }
 
     if (alpha == 0) {
         MmPspGfx_CaptureMotionBlurFrame();
-        sceGuStart(GU_DIRECT, list);
+        gfx_scegu_start_list();
         return;
     }
 

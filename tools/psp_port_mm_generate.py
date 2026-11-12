@@ -41,6 +41,22 @@ def load_backend_tool(name: str):
     if hasattr(module, "dmadata"):
         module.dmadata = mm_dmadata
     if name == "psp_port_asset_segments":
+        original_build_entries = module.build_entries
+
+        def mm_build_entries(version):
+            entries = original_build_entries(version)
+            # MM's linked GfxPrint fonts come from boot, outside code. Append
+            # its raw source without renumbering existing packed VROM handles.
+            source = ROOT / "extracted" / version / "baserom" / "boot"
+            ranges = module.read_original_vrom_ranges(version)
+            start = module.align(entries[-1]["vrom_end"], module.EXTERNAL_VROM_ALIGN)
+            original_start, original_end = ranges["boot"]
+            entries.append(dict(name="boot", source=source, size=source.stat().st_size,
+                                vrom_start=start, vrom_end=start + source.stat().st_size,
+                                original_vrom_start=original_start, original_vrom_end=original_end))
+            return entries
+
+        module.build_entries = mm_build_entries
         original_load_xml_offsets = module.NativeAssetContext._load_xml_offsets
         original_discover_native_objects = module.NativeAssetContext._discover_native_objects
         original_asset_kind = module.NativeAssetContext._asset_kind_for_object_path

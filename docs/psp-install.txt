@@ -1,0 +1,68 @@
+MM PSP installation
+
+1. Extract this archive and copy the MM_PSP folder to PSP/GAME on your
+   PSP storage:
+   - PSP Go internal storage: ef0:/PSP/GAME/MM_PSP/
+   - Memory Stick or PSP Go M2 card: ms0:/PSP/GAME/MM_PSP/
+   Keep the Plugins and data folders beside EBOOT.PBP. The same package works
+   on either device.
+
+2. Put your own big-endian, compressed US Majora's Mask ROM in
+   PSP/GAME/MM_PSP/data/basrom.z64. The ROM must be 32 MiB with CRC32 B428D8A7.
+   The filename baserom.z64 is also accepted.
+
+3. Launch MM PSP Port from the PSP Game menu. On first launch, wait for ROM
+   validation and asset conversion to finish. Later launches reuse the generated
+   data/segments/oot_psp_assets.bin file.
+
+Installed layout:
+
+PSP/GAME/MM_PSP/
+    EBOOT.PBP
+    README.txt
+    Plugins/dvemgr.prx
+    data/basrom.z64       (add your own ROM)
+
+Plugins/dvemgr.prx enables TV output on supported PSP models. Open HOME >
+Video Settings to configure it. MM requires PSP-2000/3000/Go expanded memory; PSP-1000 is unsupported.
+
+To regenerate assets, delete data/segments/oot_psp_assets.bin and launch again
+with the ROM still present.
+
+The ROM, converted asset pack, mm-psp-save.bin, controls.ini, video.ini, and
+sleep recovery data all use the storage containing the launched EBOOT. For
+example, a Go internal installation reads ef0:/PSP/GAME/MM_PSP/data/basrom.z64.
+Each installation keeps its own saves and settings. To move an installation
+between internal storage and a card, copy the whole MM_PSP folder.
+
+The archive includes the compiled port and its DVE module. You supply the ROM;
+no ROM or converted game assets are included in this download.
+
+Media Engine support uses PSP Media Engine Custom Core by m-c/d (mcidclan):
+https://github.com/mcidclan/psp-media-engine-custom-core
+
+Copyright (c) 2025 m-c/d
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to do
+so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+HOME > Video Settings > Frame Rate selects 20 FPS (default) or 60 FPS.
+Select Save video.ini to keep the setting. Game logic retains its original
+update rate; 60 FPS adds interpolated presentations. LCD/240p use triple
+buffering; 480i/480p keep double buffering to fit VRAM. Actual FPS depends on
+the scene and hardware. See docs/psp-port.md in the source tree.

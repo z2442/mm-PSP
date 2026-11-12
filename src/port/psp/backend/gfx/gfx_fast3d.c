@@ -25,17 +25,21 @@
 #include "gfx_cc.h"
 #include "gfx_window_manager_api.h"
 #include "gfx_rendering_api.h"
+#include "gfx_psp_lighting.h"
 #include "gfx_screen_config.h"
 #if defined(TARGET_PSP)
 #include "buffers.h"
+#include "oot_psp_frame_interpolation.h"
 #endif
 #include "oot_port_macros.h"
 #include "oot_psp_asset_loader.h"
 #include "oot_psp_compat.h"
 #include "oot_psp_gfx_ext.h"
+#include "oot_psp_shadow.h"
 #include "oot_psp_memory.h"
 #if defined(TARGET_PSP)
 #include "oot_psp_performance.h"
+#include "oot_psp_video_thread.h"
 #endif
 #include "segmented_address.h"
 #include "sys_matrix.h"
@@ -125,21 +129,26 @@ struct LoadedVertex {
     struct RGBA color;
     uint8_t clip_rej;
     uint8_t fog_alpha;
-    uint16_t padding;
+    uint16_t decal_lifted; /* Load-time metadata; triangle setup reads original RSP slots. */
+    float normal[3];
+    uint32_t lighting;
 } __attribute__((packed, aligned(16)));
 
 #if defined(TARGET_PSP)
-typedef char LoadedVertex_vfpu_size_check[(sizeof(struct LoadedVertex) == 48) ? 1 : -1];
+typedef char LoadedVertex_vfpu_size_check[(sizeof(struct LoadedVertex) == 64) ? 1 : -1];
+typedef char LoadedVertex_normal_offset_check[(offsetof(struct LoadedVertex, normal) == 48) ? 1 : -1];
+typedef char LoadedVertex_lighting_offset_check[(offsetof(struct LoadedVertex, lighting) == 60) ? 1 : -1];
 typedef char Vtx_vfpu_size_check[(sizeof(Vtx) == 16) ? 1 : -1];
 /* Keep the assembly entry point to four arguments so it does not depend on PSP EABI extension registers. */
 struct GfxVfpuTransformState {
     const float (*model)[4];
     const float (*projection)[4];
-    int32_t fog_mul;
-    int32_t fog_offset;
+    float fog_mul;
+    float fog_offset;
     uint32_t fog_enabled;
+    uint32_t lighting_enabled;
 };
-typedef char GfxVfpuTransformState_size_check[(sizeof(struct GfxVfpuTransformState) == 20) ? 1 : -1];
+typedef char GfxVfpuTransformState_size_check[(sizeof(struct GfxVfpuTransformState) == 24) ? 1 : -1];
 extern uint32_t gfx_clip_to_hyperplane_vfpu(struct LoadedVertex *dest, const struct LoadedVertex *source,
                                             const float plane[4], uint32_t inCount);
 extern void gfx_transform_vertices_vfpu(struct LoadedVertex* dest, const Vtx* source, uint32_t count,
@@ -178,6 +187,7 @@ struct TextureHashmapNode {
     uint8_t masks, maskt;
 #if defined(TARGET_PSP)
     uint8_t mirror_s, mirror_t;
+    bool gpu_shadow;
 #endif
     bool linear_filter;
 } __attribute__((packed, aligned(4)));
@@ -220,6 +230,7 @@ struct TriPipelineState {
     bool two_texture_multiply;
     bool two_texture_blend_uses_prim_lod;
     bool two_texture_alpha_blend;
+    bool arrow_glow;
     bool fog_uses_texture_alpha;
     bool flame_texture_atlas;
     bool material_texture;
@@ -234,9 +245,6 @@ struct TriPipelineState {
     bool alpha_mul_env;
     float tex_u_scale[2], tex_v_scale[2];
     float tex_u_bias[2], tex_v_bias[2];
-    float tex_u_shift_scale[2], tex_v_shift_scale[2];
-    float tex_u_nominal_span[2], tex_v_nominal_span[2];
-    bool tex_u_scale_to_primitive[2], tex_v_scale_to_primitive[2];
 } __attribute__((aligned(4)));
 
 typedef struct TextureTileState {
@@ -257,7 +265,6 @@ static struct RSP {
     uint8_t modelview_matrix_stack_size;
     
     Light_t current_lights[MAX_LIGHTS + 1];
-    float current_lights_coeffs[MAX_LIGHTS][3];
     float current_lookat_coeffs[2][3]; // lookat_x, lookat_y
     uint8_t current_num_lights; // includes ambient light
     bool lights_changed;
@@ -289,6 +296,7 @@ static struct RDP {
 #endif
     struct {
         const uint8_t *addr;
+        const OotPspShadowMask* shadow;
         uint8_t fmt;
         uint8_t siz;
         uint32_t width;
@@ -300,6 +308,7 @@ static struct RDP {
     } texture_to_load;
     struct {
         const uint8_t *addr;
+        const OotPspShadowMask* shadow;
         uint32_t size_bytes;
         uint32_t source_size_bytes;
         uint32_t row_stride_bytes;
@@ -321,6 +330,7 @@ static struct RDP {
     bool combine_two_texture_multiply;
     bool combine_two_texture_blend_uses_prim_lod;
     bool combine_two_texture_alpha_blend;
+    bool combine_arrow_glow;
     bool combine_alpha_mul_env;
     bool combine_flame_texture_atlas;
     bool combine_texture_tint_uses_prim_lod;
@@ -334,6 +344,8 @@ static struct RDP {
     void *z_buf_address;
     void *color_image_address;
 } rdp  __attribute__((aligned(4)));
+static const OotPspShadowMask* sPendingShadowMask;
+static OotPspFogProjection sFogProjection = { 1.0f, 0.0f };
 
 static struct RenderingState {
     struct XYWidthHeight viewport, scissor;
@@ -359,6 +371,24 @@ struct GfxDimensions gfx_current_dimensions __attribute__((aligned(4)));
 
 static inline TextureTileState* gfx_get_texture_tile(int tile) {
     return &rdp.texture_tile[tile != 0];
+}
+
+static inline uint32_t gfx_texture_tile_span(uint16_t low, uint16_t high) {
+    /* SetTileSize endpoints are 12-bit Q10.2 values. Scrolled MM wall tiles
+     * can cross zero; their extent remains positive across that boundary. */
+    return (((uint32_t)high - low) & 0xFFFU) + 4U;
+}
+
+static inline bool gfx_texture_axis_needs_mirror(uint32_t cm, uint32_t mask, uint16_t low, uint16_t high) {
+    if (!(cm & G_TX_MIRROR) || mask == G_TX_NOMASK) {
+        return false;
+    }
+
+    /* RDP clamps before masking/mirroring. Epona's eye and hair tiles set
+     * MIRROR | CLAMP with a mask covering the whole image, so coordinates
+     * beyond that image must sample its edge, not a second mirrored eye. */
+    const uint32_t span = gfx_texture_tile_span(low, high) >> G_TEXTURE_IMAGE_FRAC;
+    return !(cm & G_TX_CLAMP) || span > (1U << mask);
 }
 
 static inline bool gfx_get_render_tile_slot(uint8_t tile, int* slot) {
@@ -738,6 +768,7 @@ static bool gfx_texture_load_slot(const char* context, int* slot) {
 }
 
 static void gfx_set_invalid_loaded_texture(int tile) {
+    rdp.loaded_texture[tile].shadow = NULL;
     rdp.loaded_texture[tile].addr = sInvalidTextureBuf;
     rdp.loaded_texture[tile].size_bytes = 8;
     rdp.loaded_texture[tile].source_size_bytes = 8;
@@ -912,8 +943,10 @@ static inline uint16_t gfx_read_texture_source_be16(const uint8_t* addr, uint32_
 typedef struct psp_fast_t {
   float u,v;
   struct RGBA color;
+  float normal[3];
   float x,y,z;
 } psp_fast_t;
+typedef char psp_fast_t_size_check[(sizeof(psp_fast_t) == 36) ? 1 : -1];
 typedef struct psp_uv_t {
   float u,v;
   uint8_t alpha;
@@ -960,6 +993,18 @@ static uint32_t sPerformanceTextureUploadCount;
 static size_t buf_vbo_len;
 static size_t buf_num_vert;
 static size_t buf_vbo_num_tris;
+#if defined(TARGET_PSP)
+static bool sBatchHasVisibleFog;
+static unsigned int sBatchDepthBias;
+#endif
+/* One immutable snapshot per live RSP slot, plus one spare. Queued batches
+ * own a copy, so snapshots can be reused without modifying queued GE work. */
+static struct GfxPspLighting sLightingStates[MAX_VERTICES + 2];
+static struct GfxPspLighting sBatchLighting;
+static bool sBatchUsesLighting;
+static uint32_t sBatchLightingId;
+static bool sLightingStateDirty = true;
+static uint32_t sCurrentLighting;
 
 static struct GfxWindowManagerAPI *gfx_wapi;
 static struct GfxRenderingAPI *gfx_rapi;
@@ -1214,8 +1259,8 @@ static void gfx_upload_texture_slow(int tile, const uint8_t *buf, uint32_t width
 static inline __attribute__((always_inline)) void gfx_upload_texture(int tile, const uint8_t *buf, uint32_t width,
                                                                      uint32_t height, unsigned int type) {
     const TextureTileState* tileState = gfx_get_texture_tile(tile);
-    const bool mirror_s = (tileState->cms & G_TX_MIRROR) != 0 && tileState->masks != G_TX_NOMASK;
-    const bool mirror_t = (tileState->cmt & G_TX_MIRROR) != 0 && tileState->maskt != G_TX_NOMASK;
+    const bool mirror_s = gfx_texture_axis_needs_mirror(tileState->cms, tileState->masks, tileState->uls, tileState->lrs);
+    const bool mirror_t = gfx_texture_axis_needs_mirror(tileState->cmt, tileState->maskt, tileState->ult, tileState->lrt);
 
 #if defined(TARGET_PSP) && defined(OOTDEBUG)
     sPerformanceTextureUploadCount++;
@@ -1321,6 +1366,10 @@ void gfx_clip_interpolate_vert(struct LoadedVertex* out, const struct  LoadedVer
     // texture
     out->u = lhs->u + (rhs->u - lhs->u) * factor;
     out->v = lhs->v + (rhs->v - lhs->v) * factor;
+    for (int i = 0; i < 3; i++) {
+        out->normal[i] = lhs->normal[i] + (rhs->normal[i] - lhs->normal[i]) * factor;
+    }
+    out->lighting = lhs->lighting;
 }
 
 //*****************************************************************************
@@ -1332,12 +1381,12 @@ void gfx_clip_interpolate_vert(struct LoadedVertex* out, const struct  LoadedVer
 //*****************************************************************************
 static const float NDCPlane[6][4] __attribute__((aligned(16))) =
 {
-	{  0.f,  0.f,  1.f, -1.f },	// near
+	{  0.f,  0.f, -1.f, -1.f },	// near: z >= -w
 	{  1.f,  0.f,  0.f, -1.f },	// left
 	{ -1.f,  0.f,  0.f, -1.f },	// right
 	{  0.f,  1.f,  0.f, -1.f },	// bottom
 	{  0.f, -1.f,  0.f, -1.f },	// top
-	{  0.f,  0.f, -1.f, -1.f }	// far
+	{  0.f,  0.f,  1.f, -1.f }	// far: z <= w
 };
 
 static uint32_t clipToHyperPlane( struct LoadedVertex *dest, const struct LoadedVertex *source, uint32_t inCount, const float plane[4] )
@@ -1505,7 +1554,9 @@ static void gfx_flush(void) {
         const bool twoTextureBlend = rendering_state.tri_pipeline.two_texture_blend &&
                                      rendering_state.textures[0] != NULL && rendering_state.textures[1] != NULL;
         const bool twoTextureMultiply = twoTextureBlend && rendering_state.tri_pipeline.two_texture_multiply;
-        const bool useFog = rendering_state.tri_pipeline.use_fog;
+        // A zero-alpha fog pass changes neither color nor depth. Avoid its
+        // vertex upload, state switches, and draw when the whole batch is clear.
+        const bool useFog = rendering_state.tri_pipeline.use_fog && sBatchHasVisibleFog;
         const bool fogUsesTextureAlpha = rendering_state.tri_pipeline.fog_uses_texture_alpha;
         const bool twoTextureAlphaFog =
             useFog && twoTextureBlend && !twoTextureMultiply &&
@@ -1551,6 +1602,8 @@ static void gfx_flush(void) {
             gfx_rapi->set_use_alpha(true);
         }
 #endif
+        gfx_rapi->set_depth_bias(sBatchDepthBias);
+        gfx_scegu_set_lighting(sBatchUsesLighting ? &sBatchLighting : NULL);
         gfx_rapi->draw_triangles((float *)buf_vbo, buf_vbo_len, buf_vbo_num_tris);
 #if defined(TARGET_PSP)
         if (twoTextureBlend) {
@@ -1630,6 +1683,10 @@ static void gfx_flush(void) {
         buf_vbo_len = 0;
         buf_num_vert = 0;
         buf_vbo_num_tris = 0;
+#if defined(TARGET_PSP)
+        sBatchHasVisibleFog = false;
+        sBatchDepthBias = 0;
+#endif
         //unsigned long t1 = get_time();
         /*if (t1 - t0 > 1000) {
             printf("f: %d %d\n", num, (int)(t1 - t0));
@@ -1640,9 +1697,9 @@ static void gfx_flush(void) {
 static struct ShaderProgram *gfx_lookup_or_create_shader_program(uint32_t shader_id) {
     struct ShaderProgram *prg = gfx_rapi->lookup_shader(shader_id);
     if (prg == NULL) {
-        gfx_rapi->unload_shader(rendering_state.shader_program);
-        prg = gfx_rapi->create_and_load_new_shader(shader_id);
-        rendering_state.shader_program = prg;
+        /* Cache misses must behave like hits. The pipeline flushes and loads
+         * this program only after it has prepared the complete material. */
+        prg = gfx_rapi->create_shader(shader_id);
     }
     return prg;
 }
@@ -1788,6 +1845,17 @@ static inline uint8_t gfx_color_mul_channel(uint8_t lhs, uint8_t rhs) {
     return ((uint16_t)lhs * (uint16_t)rhs + 127) / 255;
 }
 
+static uint8_t gfx_arrow_shimmer_alpha(uint8_t alpha, float v) {
+    /* The arrow mesh's wide eight-sided rim has unscrolled T near zero;
+     * its next ring is at 32 texels. Fade just the secondary noise layer
+     * across that band. GU interpolates coverage over the faces, so noise
+     * cannot reveal the polygon boundary where the main mask is clear. */
+    const float coverage = (v - 16.0f) * (1.0f / (1024.0f - 16.0f));
+    if (coverage <= 0.0f) return 0;
+    if (coverage >= 1.0f) return alpha;
+    return (uint8_t)(alpha * coverage + 0.5f);
+}
+
 static inline void gfx_color_mul_env(struct RGBA* color) {
     color->r = gfx_color_mul_channel(color->r, rdp.env_color.r);
     color->g = gfx_color_mul_channel(color->g, rdp.env_color.g);
@@ -1878,6 +1946,29 @@ static inline struct RGBA gfx_get_vertex_rgba(const struct ColorCombiner *comb, 
     return color;
 }
 
+static inline bool gfx_get_constant_vertex_rgba(const struct TriPipelineState* state, struct RGBA* color) {
+    const struct ColorCombiner* comb = state->comb;
+    const uint8_t rgbSource = comb->vertex_color_source[0];
+    const uint8_t alphaSource = comb->vertex_color_source[1];
+    /* Without independent alpha, the RGB selector also supplies the vertex's
+     * alpha. Shade and LOD must therefore remain per vertex even when a later
+     * texture-tint correction replaces their RGB. */
+    if (rgbSource == CC_SHADE || rgbSource == CC_LOD ||
+        (state->use_alpha && (alphaSource == CC_SHADE || alphaSource == CC_LOD))) {
+        return false;
+    }
+    *color = gfx_get_vertex_rgba(comb, state->use_alpha, &white_color, 0.0f, true);
+    if (state->texture_tint_colors_corrected) {
+        color->r = state->texture_tint_env_color.r;
+        color->g = state->texture_tint_env_color.g;
+        color->b = state->texture_tint_env_color.b;
+    }
+    if (state->color_mul_env) gfx_color_mul_env(color);
+    if (state->color_mul_prim) gfx_color_mul_prim(color);
+    if (state->alpha_mul_env) color->a = gfx_color_mul_channel(color->a, rdp.env_color.a);
+    return true;
+}
+
 static struct ColorCombiner *gfx_lookup_or_create_color_combiner(uint32_t cc_id) {
     const size_t cacheIndex =
         (cc_id ^ (cc_id >> 12) ^ (cc_id >> 24)) & (COLOR_COMBINER_CACHE_SET_COUNT - 1);
@@ -1960,8 +2051,13 @@ static unsigned int gfx_texture_cache_upload_size(uint16_t width, uint16_t heigh
     }
 
     if (upload_size > sizeof(psp_texture_stage_buf)) {
-        upload_size = (size_t)width * height * bytes_per_pixel;
+        upload_width = width;
+        upload_height = height;
     }
+
+    /* The GE rounds each texture row to a 16-byte stride. Tiny intensity
+     * maps need that storage too, even though their sampling width is 8. */
+    upload_size = (((size_t)upload_width * bytes_per_pixel + 15) & ~(size_t)15) * upload_height;
 
     if (upload_size > (size_t)0xFFFFFFFFU) {
         return 0xFFFFFFFFU;
@@ -2004,6 +2100,9 @@ static void gfx_texture_cache_clear(void) {
 }
 
 void gfx_invalidate_texture_cache(void) {
+#if defined(TARGET_PSP)
+    OotPspVideoThread_Wait();
+#endif
     /* A PSP display-route change reinitializes the GU and may disturb texture
      * data in the upper EDRAM aperture. This entry point is called between
      * frames, after the old GU list has completed, so only discard the CPU and
@@ -2025,12 +2124,13 @@ static bool gfx_texture_cache_lookup(int tile, struct TextureHashmapNode **n, co
     const uint32_t source_key = OotPsp_GetExternalAssetRangeSerial(orig_addr, source_span_size);
     const bool dynamic_source = (source_key == 0) && (orig_addr != sInvalidTextureBuf) &&
                                 (orig_addr != sInvalidPaletteBuf) &&
-                                OotPsp_IsRuntimeByteRange(orig_addr, source_span_size);
+                                (rdp.loaded_texture[tile].shadow != NULL ||
+                                 OotPsp_IsRuntimeByteRange(orig_addr, source_span_size));
     const bool uses_palette = fmt == G_IM_FMT_CI;
     const uint8_t* palette_addr = uses_palette ? gfx_texture_palette_source(tile) : NULL;
     const uint32_t palette_key = uses_palette ? gfx_texture_palette_source_key(tile) : 0;
-    const uint8_t mirror_s = (tileState->cms & G_TX_MIRROR) != 0 && tileState->masks != G_TX_NOMASK;
-    const uint8_t mirror_t = (tileState->cmt & G_TX_MIRROR) != 0 && tileState->maskt != G_TX_NOMASK;
+    const uint8_t mirror_s = gfx_texture_axis_needs_mirror(tileState->cms, tileState->masks, tileState->uls, tileState->lrs);
+    const uint8_t mirror_t = gfx_texture_axis_needs_mirror(tileState->cmt, tileState->maskt, tileState->ult, tileState->lrt);
 
     hash ^= (size_t)source_key * 2654435761U;
     hash ^= (size_t)palette_addr >> 4;
@@ -2054,6 +2154,7 @@ static bool gfx_texture_cache_lookup(int tile, struct TextureHashmapNode **n, co
 #if defined(TARGET_PSP)
             && (*node)->source_key == source_key && (*node)->palette_addr == palette_addr
             && (*node)->mirror_s == mirror_s && (*node)->mirror_t == mirror_t
+            && (*node)->gpu_shadow == (rdp.loaded_texture[tile].shadow != NULL)
 #endif
         ) {
 #if defined(TARGET_PSP)
@@ -2106,7 +2207,9 @@ static bool gfx_texture_cache_lookup(int tile, struct TextureHashmapNode **n, co
     }
 
 #if defined(TARGET_PSP)
-    if (!texman_vram_space_available(gfx_texture_cache_upload_size(width, height, fmt, siz, mirror_s, mirror_t)) ||
+    const unsigned int uploadSize = rdp.loaded_texture[tile].shadow != NULL ? OOT_PSP_SHADOW_TEXTURE_BYTES :
+        gfx_texture_cache_upload_size(width, height, fmt, siz, mirror_s, mirror_t);
+    if (!texman_vram_space_available(uploadSize) ||
         !texman_texture_slot_available()) {
 #else
     if (!gfx_vram_space_available() || !texman_texture_slot_available()) {
@@ -2141,6 +2244,7 @@ static bool gfx_texture_cache_lookup(int tile, struct TextureHashmapNode **n, co
     (*node)->upload_height = height;
     (*node)->mirror_s = mirror_s;
     (*node)->mirror_t = mirror_t;
+    (*node)->gpu_shadow = rdp.loaded_texture[tile].shadow != NULL;
 #endif
     (*node)->next = NULL;
     (*node)->texture_addr = orig_addr;
@@ -2157,13 +2261,13 @@ static bool gfx_texture_cache_lookup(int tile, struct TextureHashmapNode **n, co
 static uint32_t gfx_texture_tile_width(int tile) {
     const TextureTileState* tileState = gfx_get_texture_tile(tile);
 
-    return (tileState->lrs - tileState->uls + 4) >> G_TEXTURE_IMAGE_FRAC;
+    return gfx_texture_tile_span(tileState->uls, tileState->lrs) >> G_TEXTURE_IMAGE_FRAC;
 }
 
 static uint32_t gfx_texture_tile_height(int tile) {
     const TextureTileState* tileState = gfx_get_texture_tile(tile);
 
-    return (tileState->lrt - tileState->ult + 4) >> G_TEXTURE_IMAGE_FRAC;
+    return gfx_texture_tile_span(tileState->ult, tileState->lrt) >> G_TEXTURE_IMAGE_FRAC;
 }
 
 static uint32_t gfx_texture_row_bytes(uint32_t width, uint32_t siz) {
@@ -2290,8 +2394,25 @@ static bool gfx_texture_tile_dimensions_fit_source(int tile, uint32_t width, uin
 }
 
 static void gfx_texture_import_dimensions(int tile, uint32_t* width, uint32_t* height) {
+    const TextureTileState* tileState = gfx_get_texture_tile(tile);
     uint32_t tileWidth = gfx_texture_tile_width(tile);
     uint32_t tileHeight = gfx_texture_tile_height(tile);
+
+    /* Scrolling I8 effects change tile bounds without changing the image in
+     * TMEM. In particular, elemental arrows view 32x64 masks through 4x32,
+     * 64x32 or 128x32 scroll rectangles. Importing that rectangle crops the
+     * light-arrow mask down to its almost-transparent first four rows.
+     * Wrapped/mirrored tiles retain the loaded image's stride and extent;
+     * clamped images keep their explicit tile bounds. */
+    if (tileState->fmt == G_IM_FMT_I && tileState->siz == G_IM_SIZ_8b &&
+        !(tileState->cms & G_TX_CLAMP) && !(tileState->cmt & G_TX_CLAMP) &&
+        (tileState->masks != G_TX_NOMASK || tileState->maskt != G_TX_NOMASK) &&
+        rdp.loaded_texture[tile].row_stride_bytes == 0 &&
+        gfx_try_loaded_texture_dimensions(tile, width, height) &&
+        gfx_texture_tile_dimensions_fit_import(tile, *width, *height) &&
+        gfx_texture_tile_dimensions_fit_source(tile, *width, *height)) {
+        return;
+    }
 
     if (gfx_texture_tile_dimensions_fit_import(tile, tileWidth, tileHeight) &&
         gfx_texture_tile_dimensions_fit_source(tile, tileWidth, tileHeight)) {
@@ -2654,6 +2775,16 @@ static void import_texture(int tile) {
      * for an upload into their existing allocation. */
     if (gfx_texture_cache_lookup(tile, &rendering_state.textures[tile], rdp.loaded_texture[tile].addr,
                                  fmt, siz, false, &uploadInPlace)) {
+        return;
+    }
+
+    if (rdp.loaded_texture[tile].shadow != NULL) {
+        if (!uploadInPlace) {
+            gfx_texture_cache_lookup(tile, &rendering_state.textures[tile], rdp.loaded_texture[tile].addr,
+                                     fmt, siz, true, &uploadInPlace);
+        }
+        gfx_scegu_upload_shadow_mask(tile, rendering_state.textures[tile]->texture_id,
+                                     rdp.loaded_texture[tile].shadow);
         return;
     }
 
@@ -3168,18 +3299,15 @@ static void gfx_prepare_texture_coord_state(struct TriPipelineState* state, int 
     const float shift_scale_s = gfx_texture_shift_scale(tileState->shifts);
     const float shift_scale_t = gfx_texture_shift_scale(tileState->shiftt);
 
-    state->tex_u_shift_scale[coordSlot] = shift_scale_s;
-    state->tex_v_shift_scale[coordSlot] = shift_scale_t;
+    const float nominal_span_u = 8.0f * gfx_texture_tile_span(tileState->uls, tileState->lrs);
+    const float nominal_span_v = 8.0f * gfx_texture_tile_span(tileState->ult, tileState->lrt);
 
-    state->tex_u_nominal_span[coordSlot] = 8.0f * (tileState->lrs - tileState->uls + 4);
-    state->tex_v_nominal_span[coordSlot] = 8.0f * (tileState->lrt - tileState->ult + 4);
-
-    if (state->tex_u_nominal_span[coordSlot] == 0.0f || state->tex_v_nominal_span[coordSlot] == 0.0f) {
+    if (nominal_span_u == 0.0f || nominal_span_v == 0.0f) {
         return;
     }
 
-    const float inv_nominal_span_u = 1.0f / state->tex_u_nominal_span[coordSlot];
-    const float inv_nominal_span_v = 1.0f / state->tex_v_nominal_span[coordSlot];
+    const float inv_nominal_span_u = 1.0f / nominal_span_u;
+    const float inv_nominal_span_v = 1.0f / nominal_span_v;
 
     /* Reuse each reciprocal for scale and bias. PSP scalar floating-point
      * division is expensive, and this state is rebuilt for every material. */
@@ -3189,13 +3317,14 @@ static void gfx_prepare_texture_coord_state(struct TriPipelineState* state, int 
         (filter_bias - tileState->uls * 8.0f) * inv_nominal_span_u;
     state->tex_v_bias[coordSlot] =
         (filter_bias - tileState->ult * 8.0f) * inv_nominal_span_v;
-    state->tex_u_scale_to_primitive[coordSlot] = tileState->masks == G_TX_NOMASK;
-    state->tex_v_scale_to_primitive[coordSlot] = tileState->maskt == G_TX_NOMASK;
+    /* G_TX_NOMASK clamps at the tile edge; it does not fit the tile to the
+     * primitive. The moon uses 128-texel UVs for a 64-texel tile, leaving the
+     * rest of its quad transparent. Rescaling those UVs doubles its diameter. */
 #if defined(TARGET_PSP)
     {
         const struct TextureHashmapNode* texture_node = rendering_state.textures[textureSlot];
-        const uint32_t tile_width = (tileState->lrs - tileState->uls + 4) / 4;
-        const uint32_t tile_height = (tileState->lrt - tileState->ult + 4) / 4;
+        const uint32_t tile_width = gfx_texture_tile_span(tileState->uls, tileState->lrs) / 4;
+        const uint32_t tile_height = gfx_texture_tile_span(tileState->ult, tileState->lrt) / 4;
 
         if (texture_node != NULL && tile_width != 0 && tile_height != 0) {
             if ((texture_node->upload_width != 0) && (texture_node->upload_width != tile_width)) {
@@ -3223,8 +3352,8 @@ static void gfx_prepare_texture_coord_state(struct TriPipelineState* state, int 
 static void gfx_prepare_flame_atlas_coord_state(struct TriPipelineState* state) {
     const TextureTileState* texture0 = gfx_get_texture_tile(0);
     const TextureTileState* texture1 = gfx_get_texture_tile(1);
-    const float textureSpanU = 8.0f * (texture0->lrs - texture0->uls + 4);
-    const float textureSpanV = 8.0f * (texture0->lrt - texture0->ult + 4);
+    const float textureSpanU = 8.0f * gfx_texture_tile_span(texture0->uls, texture0->lrs);
+    const float textureSpanV = 8.0f * gfx_texture_tile_span(texture0->ult, texture0->lrt);
     const uint32_t scrollPixels = (texture1->ult + 2) >> G_TEXTURE_IMAGE_FRAC;
     const uint32_t phase = ((scrollPixels + (GFX_FLAME_ATLAS_PHASE_STEP / 2)) /
                             GFX_FLAME_ATLAS_PHASE_STEP) &
@@ -3232,8 +3361,6 @@ static void gfx_prepare_flame_atlas_coord_state(struct TriPipelineState* state) 
     const uint32_t atlasX = (phase % GFX_FLAME_ATLAS_COLUMNS) * GFX_FLAME_ATLAS_FRAME_WIDTH;
     const uint32_t atlasY = (phase / GFX_FLAME_ATLAS_COLUMNS) * GFX_FLAME_ATLAS_FRAME_HEIGHT;
 
-    state->tex_u_nominal_span[0] = textureSpanU;
-    state->tex_v_nominal_span[0] = textureSpanV;
     state->tex_u_scale[0] = (GFX_FLAME_ATLAS_FRAME_WIDTH - 1.0f) /
                             (GFX_FLAME_ATLAS_WIDTH * textureSpanU);
     state->tex_v_scale[0] = (GFX_FLAME_ATLAS_FRAME_HEIGHT - 1.0f) /
@@ -3246,6 +3373,17 @@ static void gfx_prepare_flame_atlas_coord_state(struct TriPipelineState* state) 
         GFX_FLAME_ATLAS_HEIGHT;
 }
 #endif
+
+static inline void gfx_prepare_color_multipliers(struct TriPipelineState* state) {
+    /* White material factors are exact identities. Keeping these flags set
+     * makes ordinary character skin/hair use the general per-vertex combiner
+     * instead of the shade-copy loop, even though the tint changes nothing. */
+    state->color_mul_env = rdp.combine_color_mul_env &&
+        (rdp.env_color.r != 255 || rdp.env_color.g != 255 || rdp.env_color.b != 255);
+    state->color_mul_prim = rdp.combine_color_mul_prim &&
+        (rdp.prim_color.r != 255 || rdp.prim_color.g != 255 || rdp.prim_color.b != 255);
+    state->alpha_mul_env = rdp.combine_alpha_mul_env && rdp.env_color.a != 255;
+}
 
 static GFX_DL_HANDLER void gfx_dp_set_combine(uint32_t w0, uint32_t w1);
 
@@ -3320,7 +3458,7 @@ static void gfx_prepare_tri_pipeline_state(bool is_2d) {
     bool zmode_decal = (rdp.other_mode_l & ZMODE_DEC) == ZMODE_DEC;
     if (backend_state_dirty || zmode_decal != rendering_state.decal_mode) {
         gfx_flush();
-        gfx_rapi->set_zmode_decal(zmode_decal);
+        gfx_rapi->set_depth_bias(zmode_decal ? 32 : 0);
         rendering_state.decal_mode = zmode_decal;
     }
 
@@ -3456,14 +3594,18 @@ static void gfx_prepare_tri_pipeline_state(bool is_2d) {
                 tileState->masks != rendering_state.textures[i]->masks ||
                 tileState->maskt != rendering_state.textures[i]->maskt) {
                 gfx_flush();
-                gfx_rapi->set_sampler_parameters(i, linear_filter, tileState->cms, tileState->cmt,
-                                                 tileState->masks, tileState->maskt);
                 rendering_state.textures[i]->linear_filter = linear_filter;
                 rendering_state.textures[i]->cms = tileState->cms;
                 rendering_state.textures[i]->cmt = tileState->cmt;
                 rendering_state.textures[i]->masks = tileState->masks;
                 rendering_state.textures[i]->maskt = tileState->maskt;
             }
+            /* Fused materials and framebuffer effects also change TMU state.
+             * Allocation metadata cannot prove that a unit still has these
+             * settings, and the two RDP tiles may share one allocation. The
+             * backend suppresses redundant GE filter/wrap commands itself. */
+            gfx_rapi->set_sampler_parameters(i, linear_filter, tileState->cms, tileState->cmt,
+                                             tileState->masks, tileState->maskt);
         }
     }
 
@@ -3498,10 +3640,13 @@ static void gfx_prepare_tri_pipeline_state(bool is_2d) {
         if (backend_state_dirty || (rendering_state.bound_texture_id != textureId) ||
             (rendering_state.bound_texture_tile != active_texture)) {
             gfx_flush();
-            gfx_rapi->select_texture(active_texture, textureId);
-            rendering_state.bound_texture_id = textureId;
-            rendering_state.bound_texture_tile = active_texture;
         }
+        /* Imports and shadow generation can bind another image internally.
+         * Select the draw image after those operations, including cache hits.
+         * The backend suppresses redundant texture/sampler commands itself. */
+        gfx_rapi->select_texture(active_texture, textureId);
+        rendering_state.bound_texture_id = textureId;
+        rendering_state.bound_texture_tile = active_texture;
     }
 
     struct TriPipelineState *state = &rendering_state.tri_pipeline;
@@ -3515,6 +3660,7 @@ static void gfx_prepare_tri_pipeline_state(bool is_2d) {
     state->two_texture_multiply = two_texture_multiply;
     state->two_texture_blend_uses_prim_lod = rdp.combine_two_texture_blend_uses_prim_lod;
     state->two_texture_alpha_blend = rdp.combine_two_texture_alpha_blend;
+    state->arrow_glow = rdp.combine_arrow_glow;
     /* Texture-edge pixels become fully opaque after passing the alpha test.
      * When the base pass writes depth, GU_EQUAL already gives the fog pass the
      * exact same cutout mask. Sampling texture alpha again would attenuate fog
@@ -3531,20 +3677,13 @@ static void gfx_prepare_tri_pipeline_state(bool is_2d) {
     state->texture_tint_colors_corrected = textureTintColorsCorrected;
     state->two_texture_uncompensated_alpha = twoTextureUncompensatedAlpha;
     state->texture_tint_env_color = textureTintEnvColor;
-    state->color_mul_env = rdp.combine_color_mul_env;
-    state->color_mul_prim = rdp.combine_color_mul_prim;
-    state->alpha_mul_env = rdp.combine_alpha_mul_env && !material_texture;
+    gfx_prepare_color_multipliers(state);
+    state->alpha_mul_env &= !material_texture;
     for (int i = 0; i < 2; i++) {
         state->tex_u_scale[i] = 0.0f;
         state->tex_v_scale[i] = 0.0f;
         state->tex_u_bias[i] = 0.0f;
         state->tex_v_bias[i] = 0.0f;
-        state->tex_u_shift_scale[i] = 1.0f;
-        state->tex_v_shift_scale[i] = 1.0f;
-        state->tex_u_nominal_span[i] = 0.0f;
-        state->tex_v_nominal_span[i] = 0.0f;
-        state->tex_u_scale_to_primitive[i] = false;
-        state->tex_v_scale_to_primitive[i] = false;
     }
     if (state->use_texture) {
         int base_texture = state->two_texture_blend ? 0 : active_texture;
@@ -3584,7 +3723,77 @@ static inline float dot(const float a[3], const float b[3])
 static uint8_t gfx_clamp_num_lights(uint32_t num_lights) {
     const uint32_t max_lights_with_ambient = MAX_LIGHTS + 1;
 
+    if (num_lights == 0) return 1; // Always retain the ambient slot.
     return (num_lights > max_lights_with_ambient) ? max_lights_with_ambient : num_lights;
+}
+
+static uint32_t gfx_capture_lighting(void) {
+    if (!sLightingStateDirty) return sCurrentLighting;
+    struct GfxPspLighting state = {0};
+    const uint32_t directionalCount = rsp.current_num_lights - 1;
+    const uint8_t* ambient = rsp.current_lights[directionalCount].col;
+    uint32_t selected = 0;
+
+    /* Point lights have already been converted to actor-relative directions
+     * and attenuated RGB by Lights_BindPoint. Rank that resulting energy,
+     * preserving source order on ties. Never let a zero direction consume a
+     * hardware slot. */
+    for (uint32_t slot = 0; slot < GFX_PSP_MAX_LIGHTS; slot++) {
+        uint32_t best = MAX_LIGHTS, energy = 0;
+        for (uint32_t i = 0; i < directionalCount; i++) {
+            const Light_t* light = &rsp.current_lights[i];
+            const uint32_t candidate = light->col[0] + light->col[1] + light->col[2];
+            if (!(selected & (1U << i)) && candidate > energy &&
+                (light->dir[0] || light->dir[1] || light->dir[2])) {
+                best = i;
+                energy = candidate;
+            }
+        }
+        if (best == MAX_LIGHTS) break;
+        selected |= 1U << best;
+        const Light_t* light = &rsp.current_lights[best];
+        struct GfxPspDirectionalLight* dest = &state.lights[state.count++];
+        for (int axis = 0; axis < 3; axis++) dest->direction[axis] = light->dir[axis];
+        dest->color = light->col[0] | (light->col[1] << 8) | (light->col[2] << 16);
+    }
+
+    /* Preserve some energy from lights beyond the four GE slots. The mean
+     * of max(0, N dot L) over a sphere is 1/4, so approximate those weaker
+     * lights with a small ambient contribution rather than dropping them.
+     * This is computed once per light set, never per vertex. */
+    uint32_t ambientRgb[3] = {ambient[0], ambient[1], ambient[2]};
+    for (uint32_t i = 0; i < directionalCount; i++) {
+        const Light_t* light = &rsp.current_lights[i];
+        if (!(selected & (1U << i)) && (light->dir[0] || light->dir[1] || light->dir[2])) {
+            for (int axis = 0; axis < 3; axis++) ambientRgb[axis] += (light->col[axis] + 2) / 4;
+        }
+    }
+    for (int axis = 0; axis < 3; axis++) {
+        if (ambientRgb[axis] > 255) ambientRgb[axis] = 255;
+    }
+    state.ambient = ambientRgb[0] | (ambientRgb[1] << 8) | (ambientRgb[2] << 16) | 0xff000000U;
+
+    for (uint32_t i = 1; i < MAX_VERTICES + 2; i++) {
+        if (memcmp(&state, &sLightingStates[i], sizeof(state)) == 0) {
+            sLightingStateDirty = false;
+            return sCurrentLighting = i;
+        }
+    }
+    bool used[MAX_VERTICES + 2] = {false};
+    for (uint32_t i = 0; i < MAX_VERTICES; i++) used[rsp.loaded_vertices[i].lighting] = true;
+    for (uint32_t i = 1; i < MAX_VERTICES + 2; i++) {
+        if (!used[i]) {
+            /* A batch retains a copy even when no RSP slot references its
+             * snapshot. Invalidate its fast identity check before reuse. */
+            if (sBatchLightingId == i) sBatchLightingId = 0;
+            sLightingStates[i] = state;
+            sLightingStateDirty = false;
+            return sCurrentLighting = i;
+        }
+    }
+    /* 64 live slots cannot retain all 65 snapshots. */
+    assert(false);
+    return 0;
 }
 
 static void calculate_normal_dir(const Light_t *light, float coeffs[3]) {
@@ -3799,6 +4008,9 @@ static GFX_DL_HANDLER void gfx_sp_matrix(uint8_t parameters, const int32_t *addr
     memcpy(matrix, addr, sizeof(matrix));
 #endif
 
+#if defined(TARGET_PSP)
+    OotPspFrameInterpolation_Resolve(addr, matrix);
+#endif
     if (parameters & G_MTX_PROJECTION) {
         /*
          * Pending vertices still use the projection currently installed in the
@@ -3857,6 +4069,17 @@ static bool gfx_hud_anchor_enabled(void) {
     return sHudAnchor != OOT_PSP_HUD_ANCHOR_NONE;
 }
 
+static inline float gfx_transform_clip_x(float x, float w) {
+    /* Match gfx_apply_projection_matrix exactly. World and sub-viewport
+     * geometry use the original projection on GU; only anchored fullscreen
+     * HUD geometry receives the aspect/anchor adjustment. A wider CPU clip
+     * volume leaves crossing road overlays to the GE's coarse clipping. */
+    if (gfx_hud_anchor_enabled() && sHudViewportFullscreen) {
+        return x * sNdcAspectScale + sHudAnchorOffsetNdc * w;
+    }
+    return x;
+}
+
 static void gfx_update_screen_metrics(void) {
     const float width = (float)gfx_current_dimensions.width;
     const float height = gfx_current_dimensions.height != 0 ? (float)gfx_current_dimensions.height : 1.0f;
@@ -3881,41 +4104,6 @@ static float gfx_hud_anchor_offset_pixels(void) {
     return sHudAnchorOffsetPixels;
 }
 
-static GFX_DL_HANDLER void gfx_apply_unmasked_texture_axis(const struct LoadedVertex *const vertices[],
-                                                           size_t n_vertices, bool use_u, float nominal_span,
-                                                           float shift_scale, float *scale, float *bias) {
-    float min_coord;
-    float max_coord;
-    float span;
-
-    if (n_vertices == 0 || nominal_span <= 0.0f) {
-        return;
-    }
-
-    min_coord = (use_u ? vertices[0]->u : vertices[0]->v) * shift_scale;
-    max_coord = min_coord;
-
-    for (size_t i = 1; i < n_vertices; i++) {
-        const float coord = (use_u ? vertices[i]->u : vertices[i]->v) * shift_scale;
-
-        if (coord < min_coord) {
-            min_coord = coord;
-        }
-        if (coord > max_coord) {
-            max_coord = coord;
-        }
-    }
-
-    span = max_coord - min_coord;
-    if (span <= nominal_span + 1.0f) {
-        return;
-    }
-
-    /* Unmasked axes can use oversize UVs to stretch one tile, not repeat it. */
-    *scale = shift_scale / (span + 1.0f);
-    *bias = -min_coord / (span + 1.0f);
-}
-
 struct ShaderProgram {
     bool enabled;
     uint32_t shader_id;
@@ -3926,15 +4114,46 @@ struct ShaderProgram {
     int num_inputs;
 };
 
+#ifndef OOT_PSP_NATIVE_MESH_ENTRIES
+#define OOT_PSP_NATIVE_MESH_ENTRIES 8
+#endif
+#if defined(TARGET_PSP) && defined(F3DEX_GBI_2) && OOT_PSP_NATIVE_MESH_ENTRIES > 0
+static void gfx_native_forget(uint64_t mask);
+static void gfx_native_materialize(uint64_t mask);
+#else
+#define gfx_native_forget(mask) ((void)0)
+#define gfx_native_materialize(mask) ((void)0)
+#endif
+
+static bool gfx_lift_floor_decal(struct LoadedVertex* v, const float projection[4][4]) {
+    const float nx = v->normal[0], ny = v->normal[1], nz = v->normal[2];
+    const float lengthSq = nx * nx + ny * ny + nz * nz;
+    /* Terrain paths are upward-facing lit decals. A fixed one-world-unit
+     * separation covers the measured half-unit mesh rounding while avoiding
+     * a screen-depth offset that grows into several world units at distance. */
+    if (!(ny > 0.0f && ny * ny > 0.25f * lengthSq)) return false;
+    const float scale = 1.0f / sqrtf(lengthSq);
+    const float dx = nx * scale, dy = ny * scale, dz = nz * scale;
+    v->x += dx;
+    v->y += dy;
+    v->z += dz;
+    /* Update the CPU clip coordinates before clipping. GU projects the same
+     * displaced positions, so screen-edge intersections remain consistent. */
+    v->_x += dx * projection[0][0] + dy * projection[1][0] + dz * projection[2][0];
+    v->_y += dx * projection[0][1] + dy * projection[1][1] + dz * projection[2][1];
+    v->_z += dx * projection[0][2] + dy * projection[1][2] + dz * projection[2][2];
+    v->_w += dx * projection[0][3] + dy * projection[1][3] + dz * projection[2][3];
+    return true;
+}
+
 static bool gfx_sp_vertex(size_t n_vertices, size_t dest_index, const Vtx *vertices) {
 #if !defined(TARGET_PSP)
     float temp_vec[4] __attribute__((aligned(16)));
     float model_vec[4] __attribute__((aligned(16)));
     float proj_vec[4] __attribute__((aligned(16)));
 #endif
-    const float hudAnchorOffsetNdc = sHudViewportFullscreen ? sHudAnchorOffsetNdc : 0.0f;
     const uint32_t geometryMode = rsp.geometry_mode;
-    const uint8_t directionalLightCount = rsp.current_num_lights - 1;
+    uint32_t lighting = 0;
 #if defined(TARGET_PSP)
     if (n_vertices == 0) {
         return true;
@@ -3951,25 +4170,27 @@ static bool gfx_sp_vertex(size_t n_vertices, size_t dest_index, const Vtx *verti
         return false;
     }
 
+    gfx_native_forget((UINT64_MAX >> (64 - n_vertices)) << dest_index);
+
+    if (geometryMode & G_LIGHTING) lighting = gfx_capture_lighting();
+
     {
         const struct GfxVfpuTransformState transformState = {
             rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1],
             rsp.P_matrix,
-            rsp.fog_mul,
-            rsp.fog_offset,
+            rsp.fog_mul * sFogProjection.scale,
+            rsp.fog_offset + rsp.fog_mul * sFogProjection.offset,
             (geometryMode & G_FOG) != 0,
+            (geometryMode & G_LIGHTING) != 0,
         };
 
         gfx_transform_vertices_vfpu(&rsp.loaded_vertices[dest_index], vertices, n_vertices, &transformState);
     }
 #endif
-    if ((geometryMode & G_LIGHTING) && rsp.lights_changed) {
+    if ((geometryMode & G_LIGHTING) && (geometryMode & G_TEXTURE_GEN) && rsp.lights_changed) {
         static const Light_t lookat_x = {{0, 0, 0}, 0, {0, 0, 0}, 0, {127, 0, 0}, 0};
         static const Light_t lookat_y = {{0, 0, 0}, 0, {0, 0, 0}, 0, {0, 127, 0}, 0};
 
-        for (int i = 0; i < directionalLightCount; i++) {
-            calculate_normal_dir(&rsp.current_lights[i], rsp.current_lights_coeffs[i]);
-        }
         calculate_normal_dir(&lookat_x, rsp.current_lookat_coeffs[0]);
         calculate_normal_dir(&lookat_y, rsp.current_lookat_coeffs[1]);
         rsp.lights_changed = false;
@@ -3979,10 +4200,16 @@ static bool gfx_sp_vertex(size_t n_vertices, size_t dest_index, const Vtx *verti
         const Vtx_t *v = &vertices[i].v;
         const Vtx_tn *vn = &vertices[i].n;
         struct LoadedVertex *d = &rsp.loaded_vertices[dest_index];
+        d->lighting = lighting;
+        d->decal_lifted = 0;
 
 #if defined(TARGET_PSP)
+        if ((rdp.other_mode_l & ZMODE_DEC) == ZMODE_DEC &&
+            (geometryMode & G_LIGHTING) && !(geometryMode & G_TEXTURE_GEN)) {
+            d->decal_lifted = gfx_lift_floor_decal(d, rsp.P_matrix);
+        }
         float w = d->_w;
-        float x = gfx_adjust_x_for_aspect_ratio(d->_x);
+        float x = gfx_transform_clip_x(d->_x, w);
         const float y = d->_y;
         const float z = d->_z;
 #else
@@ -3995,39 +4222,18 @@ static bool gfx_sp_vertex(size_t n_vertices, size_t dest_index, const Vtx *verti
         gfx_transform_vec4(proj_vec, rsp.P_matrix, model_vec);
 
         float w = proj_vec[3];
-        float x = gfx_adjust_x_for_aspect_ratio(proj_vec[0]);
+        float x = gfx_transform_clip_x(proj_vec[0], w);
         const float y = proj_vec[1];
         const float z = proj_vec[2];
 #endif
-
-        if (hudAnchorOffsetNdc != 0.0f) {
-            x += hudAnchorOffsetNdc * w;
-        }
 
         short U = v->tc[0] * rsp.texture_scaling_factor.s >> 16;
         short V = v->tc[1] * rsp.texture_scaling_factor.t >> 16;
         
         if (geometryMode & G_LIGHTING) {
-            unsigned int r = rsp.current_lights[directionalLightCount].col[0];
-            unsigned int g = rsp.current_lights[directionalLightCount].col[1];
-            unsigned int b = rsp.current_lights[directionalLightCount].col[2];
-            
-            for (int i = 0; i < directionalLightCount; i++) {
-                float intensity = 0;
-                intensity += vn->n[0] * rsp.current_lights_coeffs[i][0];
-                intensity += vn->n[1] * rsp.current_lights_coeffs[i][1];
-                intensity += vn->n[2] * rsp.current_lights_coeffs[i][2];
-                intensity *= (1.0f / 127.0f);
-                if (intensity > 0.0f) {
-                    r += intensity * rsp.current_lights[i].col[0];
-                    g += intensity * rsp.current_lights[i].col[1];
-                    b += intensity * rsp.current_lights[i].col[2];
-                }
-            }
-            
-            d->color.r = r > 255 ? 255 : r;
-            d->color.g = g > 255 ? 255 : g;
-            d->color.b = b > 255 ? 255 : b;
+            /* GE supplies shade RGB. CPU combiner multiplication below now
+             * produces the material tint, rather than a prelit color. */
+            d->color.r = d->color.g = d->color.b = 255;
             
             if (geometryMode & G_TEXTURE_GEN) {
                 float dotx = 0, doty = 0;
@@ -4088,6 +4294,8 @@ static bool gfx_sp_cull_display_list(uint32_t firstVertex, uint32_t lastVertex) 
         (firstVertex > lastVertex)) {
         return false;
     }
+
+    gfx_native_materialize((UINT64_MAX >> (63 - lastVertex + firstVertex)) << firstVertex);
 
     /* G_CULLDL ends the current display list when every bounding-volume
      * vertex lies outside the same side of the view frustum. SPVertex has
@@ -4169,6 +4377,252 @@ static inline __attribute__((always_inline)) float gfx_triangle_cross_homogeneou
 #define GFX_TRI_INDEX_DIVISOR 10
 #endif
 
+static inline __attribute__((always_inline)) void gfx_emit_simple_base_vertex(
+    psp_fast_t* out, const struct LoadedVertex* vertex, bool textured,
+    float uScale, float vScale, float uBias, float vBias) {
+    out->u = textured ? vertex->u * uScale + uBias : 0.0f;
+    out->v = textured ? vertex->v * vScale + vBias : 0.0f;
+    out->color = vertex->color;
+    memcpy(out->normal, vertex->normal, sizeof(out->normal));
+    out->x = vertex->x;
+    out->y = vertex->y;
+    out->z = vertex->z;
+}
+
+static void gfx_initialize_fog_prefix(const struct TriPipelineState* state, size_t count) {
+    /* Earlier polygons in this batch had zero fog in both passes. If a later
+     * polygon makes fog visible, reconstruct their transparent overlay from
+     * the base vertices once. Entirely clear batches never build this stream. */
+    struct RGBA color = rdp.fog_color;
+    color.a = 0;
+    if (state->fog_uses_texture_alpha) {
+        psp_fog_textured_t* fog = buf_vbo_fog.textured;
+        for (size_t i = 0; i < count; i++) {
+            fog[i].u = buf_vbo[i].u;
+            fog[i].v = buf_vbo[i].v;
+            fog[i].color = color;
+            fog[i].x = buf_vbo[i].x;
+            fog[i].y = buf_vbo[i].y;
+            fog[i].z = buf_vbo[i].z;
+        }
+    } else {
+        psp_fog_color_t* fog = buf_vbo_fog.color;
+        for (size_t i = 0; i < count; i++) {
+            fog[i].color = color;
+            fog[i].x = buf_vbo[i].x;
+            fog[i].y = buf_vbo[i].y;
+            fog[i].z = buf_vbo[i].z;
+        }
+    }
+    if (state->two_texture_blend && state->two_texture_alpha_blend) {
+        memset(buf_vbo_fog_tex1_alpha, 0, count);
+    }
+}
+
+static GFX_DL_HANDLER bool gfx_emit_simple_vertices(struct LoadedVertex* const* vertices, size_t count,
+                                     const struct TriPipelineState* state) {
+    const struct ColorCombiner* comb = state->comb;
+    psp_fast_t* output;
+    const float uScale = state->tex_u_scale[0], vScale = state->tex_v_scale[0];
+    const float uBias = state->tex_u_bias[0], vBias = state->tex_v_bias[0];
+
+    if (comb->vertex_color_source[0] != CC_SHADE ||
+        (state->use_alpha && comb->vertex_color_source[1] != CC_SHADE) ||
+        state->texture_tint_colors_corrected || state->color_mul_env || state->color_mul_prim ||
+        state->alpha_mul_env || state->two_texture_blend) {
+        return false;
+    }
+
+    /* Decode the material once for this polygon. Common shade batches avoid
+     * combiner switches and optional effect tests at every output vertex. */
+    output = &buf_vbo[buf_num_vert];
+    if (state->use_texture) {
+        for (size_t i = 0; i < count; i++) {
+            gfx_emit_simple_base_vertex(output + i, vertices[i], true, uScale, vScale, uBias, vBias);
+        }
+    } else {
+        for (size_t i = 0; i < count; i++) {
+            gfx_emit_simple_base_vertex(output + i, vertices[i], false, uScale, vScale, uBias, vBias);
+        }
+    }
+    bool emitFog = state->use_fog && sBatchHasVisibleFog;
+    if (state->use_fog && !emitFog) {
+        for (size_t i = 0; i < count; i++) {
+            const struct LoadedVertex* vertex = vertices[i];
+            const uint8_t alpha = state->use_alpha
+                ? gfx_color_mul_channel(vertex->fog_alpha, vertex->color.a) : vertex->fog_alpha;
+            if (alpha != 0) {
+                gfx_initialize_fog_prefix(state, buf_num_vert);
+                emitFog = true;
+                break;
+            }
+        }
+    }
+    if (emitFog) {
+        const struct RGBA color = rdp.fog_color;
+        uint8_t visibleAlpha = 0;
+
+        if (state->fog_uses_texture_alpha) {
+            psp_fog_textured_t* fog = &buf_vbo_fog.textured[buf_num_vert];
+            for (size_t i = 0; i < count; i++) {
+                const struct LoadedVertex* vertex = vertices[i];
+                const uint8_t alpha = state->use_alpha
+                    ? gfx_color_mul_channel(vertex->fog_alpha, vertex->color.a) : vertex->fog_alpha;
+                fog[i].u = output[i].u;
+                fog[i].v = output[i].v;
+                fog[i].color = color;
+                fog[i].color.a = alpha;
+                fog[i].x = vertex->x;
+                fog[i].y = vertex->y;
+                fog[i].z = vertex->z;
+                visibleAlpha |= alpha;
+            }
+        } else {
+            psp_fog_color_t* fog = &buf_vbo_fog.color[buf_num_vert];
+            for (size_t i = 0; i < count; i++) {
+                const struct LoadedVertex* vertex = vertices[i];
+                const uint8_t alpha = state->use_alpha
+                    ? gfx_color_mul_channel(vertex->fog_alpha, vertex->color.a) : vertex->fog_alpha;
+                fog[i].color = color;
+                fog[i].color.a = alpha;
+                fog[i].x = vertex->x;
+                fog[i].y = vertex->y;
+                fog[i].z = vertex->z;
+                visibleAlpha |= alpha;
+            }
+        }
+        sBatchHasVisibleFog |= visibleAlpha != 0;
+    }
+    buf_num_vert += count;
+    buf_vbo_len += count * sizeof(psp_fast_t);
+    return true;
+}
+
+/* Keep the multipass/tint/LOD fallback out of the common triangle handler.
+ * Its register saves and instruction footprint otherwise affect ordinary
+ * character triangles even when the shade-copy emitter handles them. */
+static GFX_DL_HANDLER void gfx_emit_general_vertices(struct LoadedVertex* const* clipped_vertices,
+                                                     size_t clipped_vertices_num,
+                                                     const struct TriPipelineState* state) {
+    struct ColorCombiner* comb = state->comb;
+    const bool use_alpha = state->use_alpha;
+    const bool use_texture = state->use_texture;
+    const float* tex_u_scale = state->tex_u_scale;
+    const float* tex_v_scale = state->tex_v_scale;
+    const float* tex_u_bias = state->tex_u_bias;
+    const float* tex_v_bias = state->tex_v_bias;
+    struct RGBA constantColor;
+    const bool hasConstantColor = gfx_get_constant_vertex_rgba(state, &constantColor);
+
+    size_t i;
+    for (i = 0; i < clipped_vertices_num; i++) {
+        const struct LoadedVertex *vertex = clipped_vertices[i];
+        psp_fast_t *out = &buf_vbo[buf_num_vert];
+
+        out->x = vertex->x;
+        out->y = vertex->y;
+        out->z = vertex->z;
+        memcpy(out->normal, vertex->normal, sizeof(out->normal));
+
+        if (use_texture) {
+            out->u = vertex->u * tex_u_scale[0] + tex_u_bias[0];
+            out->v = vertex->v * tex_v_scale[0] + tex_v_bias[0];
+            /* Both fallback passes consume this stream, including multiply.
+             * Reusing a previous batch's UVs splits the detail layer into
+             * unrelated patches at triangle boundaries. */
+            if (state->two_texture_blend) {
+                buf_vbo_tex1[buf_num_vert].u = vertex->u * tex_u_scale[1] + tex_u_bias[1];
+                buf_vbo_tex1[buf_num_vert].v = vertex->v * tex_v_scale[1] + tex_v_bias[1];
+            }
+        } else {
+            out->u = 0.0f;
+            out->v = 0.0f;
+        }
+
+        if (hasConstantColor) {
+            out->color = constantColor;
+        } else {
+            out->color = gfx_get_vertex_rgba(comb, use_alpha, &vertex->color, vertex->w, true);
+            if (state->texture_tint_colors_corrected) {
+                out->color.r = state->texture_tint_env_color.r;
+                out->color.g = state->texture_tint_env_color.g;
+                out->color.b = state->texture_tint_env_color.b;
+            }
+            if (state->color_mul_env) {
+                gfx_color_mul_env(&out->color);
+            }
+            if (state->color_mul_prim) {
+                gfx_color_mul_prim(&out->color);
+            }
+            if (state->alpha_mul_env) {
+                out->color.a = gfx_color_mul_channel(out->color.a, rdp.env_color.a);
+            }
+        }
+
+        const uint8_t surfaceAlpha = use_alpha ? out->color.a : 0xFF;
+
+        if (state->two_texture_blend && !state->two_texture_multiply) {
+            uint8_t baseAlpha;
+            uint8_t overlayAlpha;
+            const uint8_t mixAlpha = state->two_texture_blend_uses_prim_lod
+                                         ? rdp.prim_lod_frac
+                                         : rdp.env_color.a;
+
+            gfx_two_texture_blend_pass_alphas(out->color.a, mixAlpha, state->two_texture_alpha_blend,
+                                              state->two_texture_uncompensated_alpha, &baseAlpha,
+                                              &overlayAlpha);
+            out->color.a = baseAlpha;
+            if (state->arrow_glow) overlayAlpha = gfx_arrow_shimmer_alpha(overlayAlpha, vertex->v);
+            buf_vbo_tex1[buf_num_vert].alpha = overlayAlpha;
+        }
+        if (state->use_fog && (sBatchHasVisibleFog || vertex->fog_alpha != 0)) {
+            struct RGBA fogColor = rdp.fog_color;
+            const bool hadVisibleFog = sBatchHasVisibleFog;
+
+            fogColor.a = gfx_color_mul_channel(vertex->fog_alpha, surfaceAlpha);
+            if (state->two_texture_blend && !state->two_texture_multiply && state->two_texture_alpha_blend) {
+                uint8_t baseAlpha;
+                uint8_t overlayAlpha;
+                const uint8_t mixAlpha = state->two_texture_blend_uses_prim_lod
+                                             ? rdp.prim_lod_frac
+                                             : rdp.env_color.a;
+
+                gfx_two_texture_blend_pass_alphas(fogColor.a, mixAlpha, true,
+                                                  state->two_texture_uncompensated_alpha, &baseAlpha,
+                                                  &overlayAlpha);
+                fogColor.a = baseAlpha;
+                buf_vbo_fog_tex1_alpha[buf_num_vert] = overlayAlpha;
+                sBatchHasVisibleFog |= overlayAlpha != 0;
+            }
+            sBatchHasVisibleFog |= fogColor.a != 0;
+            if (!hadVisibleFog && sBatchHasVisibleFog) {
+                gfx_initialize_fog_prefix(state, buf_num_vert);
+            }
+            if (sBatchHasVisibleFog) {
+                if (state->fog_uses_texture_alpha) {
+                    psp_fog_textured_t* fogOut = &buf_vbo_fog.textured[buf_num_vert];
+
+                    fogOut->u = out->u;
+                    fogOut->v = out->v;
+                    fogOut->color = fogColor;
+                    fogOut->x = vertex->x;
+                    fogOut->y = vertex->y;
+                    fogOut->z = vertex->z;
+                } else {
+                    psp_fog_color_t* fogOut = &buf_vbo_fog.color[buf_num_vert];
+
+                    fogOut->color = fogColor;
+                    fogOut->x = vertex->x;
+                    fogOut->y = vertex->y;
+                    fogOut->z = vertex->z;
+                }
+            }
+        }
+        buf_num_vert++;
+        buf_vbo_len += sizeof(psp_fast_t);
+    }
+}
+
 static void gfx_sp_triangles(uint32_t packed0, uint32_t packed1, uint8_t triangleCount) {
     /* Most model geometry uses G_TRI2. Keep both triangles in one handler invocation so the PSP pays the large
      * clip/material setup prologue once per command while retaining independent culling and clipping. */
@@ -4180,6 +4634,8 @@ static void gfx_sp_triangles(uint32_t packed0, uint32_t packed1, uint8_t triangl
         const uint8_t vtx1_idx = ((packed >> 16) & 0xFF) / GFX_TRI_INDEX_DIVISOR;
         const uint8_t vtx2_idx = ((packed >> 8) & 0xFF) / GFX_TRI_INDEX_DIVISOR;
         const uint8_t vtx3_idx = (packed & 0xFF) / GFX_TRI_INDEX_DIVISOR;
+        if (vtx1_idx >= MAX_VERTICES || vtx2_idx >= MAX_VERTICES || vtx3_idx >= MAX_VERTICES) continue;
+        gfx_native_materialize((UINT64_C(1) << vtx1_idx) | (UINT64_C(1) << vtx2_idx) | (UINT64_C(1) << vtx3_idx));
         struct LoadedVertex *v1 = &rsp.loaded_vertices[vtx1_idx];
         struct LoadedVertex *v2 = &rsp.loaded_vertices[vtx2_idx];
         struct LoadedVertex *v3 = &rsp.loaded_vertices[vtx3_idx];
@@ -4276,51 +4732,22 @@ static void gfx_sp_triangles(uint32_t packed0, uint32_t packed1, uint8_t triangl
     gfx_prepare_tri_pipeline_state(false);
     const struct TriPipelineState *state = &rendering_state.tri_pipeline;
     struct ColorCombiner *comb = state->comb;
-    const bool use_alpha = state->use_alpha;
-    const bool use_texture = state->use_texture;
-    const float* tex_u_scale = state->tex_u_scale;
-    const float* tex_v_scale = state->tex_v_scale;
-    const float* tex_u_bias = state->tex_u_bias;
-    const float* tex_v_bias = state->tex_v_bias;
-    float adjusted_tex_u_scale[2];
-    float adjusted_tex_v_scale[2];
-    float adjusted_tex_u_bias[2];
-    float adjusted_tex_v_bias[2];
-    const uint32_t shader_program_id = rendering_state.shader_program->shader_id;
 
-    if (use_texture) {
-        const struct LoadedVertex *uv_vertices[3] = {v1, v2, v3};
-        const int coord_count = state->two_texture_blend ? 2 : 1;
-        const bool adjust_tex_coords =
-            state->tex_u_scale_to_primitive[0] || state->tex_v_scale_to_primitive[0] ||
-            (state->two_texture_blend &&
-             (state->tex_u_scale_to_primitive[1] || state->tex_v_scale_to_primitive[1]));
-
-        if (adjust_tex_coords) {
-            memcpy(adjusted_tex_u_scale, state->tex_u_scale, sizeof(adjusted_tex_u_scale));
-            memcpy(adjusted_tex_v_scale, state->tex_v_scale, sizeof(adjusted_tex_v_scale));
-            memcpy(adjusted_tex_u_bias, state->tex_u_bias, sizeof(adjusted_tex_u_bias));
-            memcpy(adjusted_tex_v_bias, state->tex_v_bias, sizeof(adjusted_tex_v_bias));
-            tex_u_scale = adjusted_tex_u_scale;
-            tex_v_scale = adjusted_tex_v_scale;
-            tex_u_bias = adjusted_tex_u_bias;
-            tex_v_bias = adjusted_tex_v_bias;
-
-            for (int coord = 0; coord < coord_count; coord++) {
-                if (state->tex_u_scale_to_primitive[coord]) {
-                    gfx_apply_unmasked_texture_axis(uv_vertices, 3, true, state->tex_u_nominal_span[coord],
-                                                    state->tex_u_shift_scale[coord], &adjusted_tex_u_scale[coord],
-                                                    &adjusted_tex_u_bias[coord]);
-                }
-                if (state->tex_v_scale_to_primitive[coord]) {
-                    gfx_apply_unmasked_texture_axis(uv_vertices, 3, false, state->tex_v_nominal_span[coord],
-                                                    state->tex_v_shift_scale[coord], &adjusted_tex_v_scale[coord],
-                                                    &adjusted_tex_v_bias[coord]);
-                }
-            }
-        }
+    /* Lighting is a load-time property, like position. In particular, a limb
+     * matrix change must not rotate normals or relight cached parent vertices.
+     * GE has one light set per draw; for a triangle spanning different light
+     * sets use the majority set, or the first vertex's set if all differ. */
+    uint32_t lighting = v1->lighting;
+    if (v2->lighting == v3->lighting) lighting = v2->lighting;
+    const bool useLighting = lighting != 0 && comb->vertex_color_source[0] == CC_SHADE &&
+                             !state->texture_tint_colors_corrected;
+    if (sBatchUsesLighting != useLighting || (useLighting && sBatchLightingId != lighting)) {
+        gfx_flush();
+        sBatchUsesLighting = useLighting;
+        sBatchLightingId = lighting;
+        if (useLighting) sBatchLighting = sLightingStates[lighting];
     }
-    
+
     const size_t new_tri_count = clipped_vertices_num / 3;
 
     if (new_tri_count == 0) {
@@ -4341,100 +4768,19 @@ static void gfx_sp_triangles(uint32_t packed0, uint32_t packed1, uint8_t triangl
         gfx_flush();
     }
 
-    size_t i;
-    for (i = 0; i < clipped_vertices_num; i++) {
-        const struct LoadedVertex *vertex = clipped_vertices[i];
-        psp_fast_t *out = &buf_vbo[buf_num_vert];
-
-        out->x = vertex->x;
-        out->y = vertex->y;
-        out->z = vertex->z;
-        
-        if (use_texture) {
-            out->u = vertex->u * tex_u_scale[0] + tex_u_bias[0];
-            out->v = vertex->v * tex_v_scale[0] + tex_v_bias[0];
-            if (state->two_texture_blend) {
-                buf_vbo_tex1[buf_num_vert].u = vertex->u * tex_u_scale[1] + tex_u_bias[1];
-                buf_vbo_tex1[buf_num_vert].v = vertex->v * tex_v_scale[1] + tex_v_bias[1];
-            }
-        } else {
-            out->u = 0.0f;
-            out->v = 0.0f;
-        }
-        
-        out->color = gfx_get_vertex_rgba(comb, use_alpha, &vertex->color, vertex->w, true);
-        if (state->texture_tint_colors_corrected) {
-            out->color.r = state->texture_tint_env_color.r;
-            out->color.g = state->texture_tint_env_color.g;
-            out->color.b = state->texture_tint_env_color.b;
-        }
-        if (state->color_mul_env) {
-            gfx_color_mul_env(&out->color);
-        }
-        if (state->color_mul_prim) {
-            gfx_color_mul_prim(&out->color);
-        }
-        if (state->alpha_mul_env) {
-            out->color.a = gfx_color_mul_channel(out->color.a, rdp.env_color.a);
-        }
-
-        const uint8_t surfaceAlpha = use_alpha ? out->color.a : 0xFF;
-
-        if (state->two_texture_blend && !state->two_texture_multiply) {
-            uint8_t baseAlpha;
-            uint8_t overlayAlpha;
-            const uint8_t mixAlpha = state->two_texture_blend_uses_prim_lod
-                                         ? rdp.prim_lod_frac
-                                         : rdp.env_color.a;
-
-            gfx_two_texture_blend_pass_alphas(out->color.a, mixAlpha, state->two_texture_alpha_blend,
-                                              state->two_texture_uncompensated_alpha, &baseAlpha,
-                                              &overlayAlpha);
-            out->color.a = baseAlpha;
-            buf_vbo_tex1[buf_num_vert].alpha = overlayAlpha;
-        }
-        if (state->use_fog) {
-            struct RGBA fogColor = rdp.fog_color;
-
-            fogColor.a = gfx_color_mul_channel(vertex->fog_alpha, surfaceAlpha);
-            if (state->two_texture_blend && !state->two_texture_multiply &&
-                state->two_texture_alpha_blend) {
-                uint8_t baseAlpha;
-                uint8_t overlayAlpha;
-                const uint8_t mixAlpha = state->two_texture_blend_uses_prim_lod
-                                             ? rdp.prim_lod_frac
-                                             : rdp.env_color.a;
-
-                gfx_two_texture_blend_pass_alphas(fogColor.a, mixAlpha, true,
-                                                  state->two_texture_uncompensated_alpha, &baseAlpha,
-                                                  &overlayAlpha);
-                fogColor.a = baseAlpha;
-                buf_vbo_fog_tex1_alpha[buf_num_vert] = overlayAlpha;
-            }
-            if (state->fog_uses_texture_alpha) {
-                psp_fog_textured_t* fogOut = &buf_vbo_fog.textured[buf_num_vert];
-
-                fogOut->u = out->u;
-                fogOut->v = out->v;
-                fogOut->color = fogColor;
-                fogOut->x = vertex->x;
-                fogOut->y = vertex->y;
-                fogOut->z = vertex->z;
-            } else {
-                psp_fog_color_t* fogOut = &buf_vbo_fog.color[buf_num_vert];
-
-                fogOut->color = fogColor;
-                fogOut->x = vertex->x;
-                fogOut->y = vertex->y;
-                fogOut->z = vertex->z;
-            }
-        }
-        if (shader_program_id == 0x01A00045) {
-            /* Matches the old code, which only updated the temporary pointer after the copy. */
-        }
-        buf_num_vert++;
-        buf_vbo_len += sizeof(psp_fast_t);
+    if (rendering_state.decal_mode) {
+        const unsigned int bias = v1->decal_lifted && v2->decal_lifted && v3->decal_lifted ? 2 : 32;
+        if (sBatchDepthBias != 0 && sBatchDepthBias != bias) gfx_flush();
+        sBatchDepthBias = bias;
     }
+
+    if (gfx_emit_simple_vertices(clipped_vertices, clipped_vertices_num, state)) {
+        buf_vbo_num_tris += new_tri_count;
+        if (buf_vbo_num_tris >= MAX_BUFFERED) gfx_flush();
+        continue;
+    }
+
+    gfx_emit_general_vertices(clipped_vertices, clipped_vertices_num, state);
     buf_vbo_num_tris += new_tri_count;
     if (buf_vbo_num_tris >= MAX_BUFFERED) {
         gfx_flush();
@@ -4743,8 +5089,11 @@ static void gfx_sp_movemem(uint8_t index, uint8_t offset, const void* data) {
                     break;
                 }
 #endif
-                // NOTE: reads out of bounds if it is an ambient light
-                memcpy(rsp.current_lights + lightidx, data, sizeof(Light_t));
+                const size_t lightSize = lightidx == rsp.current_num_lights - 1
+                                             ? sizeof(Ambient_t) : sizeof(Light_t);
+                memset(rsp.current_lights + lightidx, 0, sizeof(Light_t));
+                memcpy(rsp.current_lights + lightidx, data, lightSize);
+                sLightingStateDirty = true;
             }
             break;
         }
@@ -4761,8 +5110,14 @@ static void gfx_sp_movemem(uint8_t index, uint8_t offset, const void* data) {
             }
         }
 #endif
-            // NOTE: reads out of bounds if it is an ambient light
-            memcpy(rsp.current_lights + (index - G_MV_L0) / 2, data, sizeof(Light_t));
+            {
+                const uint32_t lightidx = (index - G_MV_L0) / 2;
+                const size_t lightSize = lightidx == rsp.current_num_lights - 1
+                                             ? sizeof(Ambient_t) : sizeof(Light_t);
+                memset(rsp.current_lights + lightidx, 0, sizeof(Light_t));
+                memcpy(rsp.current_lights + lightidx, data, lightSize);
+                sLightingStateDirty = true;
+            }
             break;
 #endif
     }
@@ -4779,6 +5134,7 @@ static void gfx_sp_moveword(uint8_t index, uint16_t offset, uint32_t data) {
             rsp.current_num_lights = gfx_clamp_num_lights((data - 0x80000000U) / 32);
 #endif
             rsp.lights_changed = 1;
+            sLightingStateDirty = true;
             break;
         case G_MW_FOG:
             rsp.fog_mul = (int16_t)(data >> 16);
@@ -4815,9 +5171,12 @@ static void gfx_dp_set_scissor(uint32_t mode, uint32_t ulx, uint32_t uly, uint32
     _UNUSED(mode);
 
     float x = ulx / 4.0f * RATIO_X;
-    float y = (SCREEN_HEIGHT - lry / 4.0f) * RATIO_Y;
     float width = (lrx - ulx) / 4.0f * RATIO_X;
-    float height = (lry - uly) / 4.0f * RATIO_Y;
+    /* Quantize the top/bottom endpoints before converting to GU's bottom
+     * origin. Rounding Y and height separately can move the top edge by two
+     * pixels, exposing the clear color between MM's scene and black bars. */
+    const uint32_t top = uly * gfx_current_dimensions.height / (SCREEN_HEIGHT * 4U);
+    const uint32_t bottom = lry * gfx_current_dimensions.height / (SCREEN_HEIGHT * 4U);
 
     /* HUD scissor windows must follow the same aspect correction and anchor
      * as HUD vertices. Keep full-width scissors covering the whole display. */
@@ -4826,7 +5185,9 @@ static void gfx_dp_set_scissor(uint32_t mode, uint32_t ulx, uint32_t uly, uint32
         width = (lrx - ulx) / 4.0f * RATIO_Y;
     }
     
-    struct XYWidthHeight scissor = { x, y, width, height };
+    struct XYWidthHeight scissor = {
+        x, gfx_current_dimensions.height - bottom, width, bottom - top
+    };
 
     if (memcmp(&rdp.scissor, &scissor, sizeof(scissor)) == 0) {
         return;
@@ -4839,6 +5200,8 @@ static void gfx_dp_set_scissor(uint32_t mode, uint32_t ulx, uint32_t uly, uint32
 
 static void gfx_dp_set_texture_image(uint32_t format, uint32_t size, uint32_t width, const void* addr) {
     rdp.texture_to_load.addr = addr;
+    rdp.texture_to_load.shadow = addr == (const void*)sPendingShadowMask ? sPendingShadowMask : NULL;
+    sPendingShadowMask = NULL;
     rdp.texture_to_load.fmt = format;
     rdp.texture_to_load.siz = size;
     rdp.texture_to_load.width = width;
@@ -4853,10 +5216,10 @@ static void gfx_dp_set_tile(uint8_t fmt, uint32_t siz, uint32_t line, uint32_t t
     if (gfx_get_render_tile_slot(tile, &renderSlot)) {
         TextureTileState* tileState = gfx_get_texture_tile(renderSlot);
         const uint32_t lineSizeBytes = line * 8;
-        const bool oldMirrorS = (tileState->cms & G_TX_MIRROR) != 0 && tileState->masks != G_TX_NOMASK;
-        const bool oldMirrorT = (tileState->cmt & G_TX_MIRROR) != 0 && tileState->maskt != G_TX_NOMASK;
-        const bool newMirrorS = (cms & G_TX_MIRROR) != 0 && masks != G_TX_NOMASK;
-        const bool newMirrorT = (cmt & G_TX_MIRROR) != 0 && maskt != G_TX_NOMASK;
+        const bool oldMirrorS = gfx_texture_axis_needs_mirror(tileState->cms, tileState->masks, tileState->uls, tileState->lrs);
+        const bool oldMirrorT = gfx_texture_axis_needs_mirror(tileState->cmt, tileState->maskt, tileState->ult, tileState->lrt);
+        const bool newMirrorS = gfx_texture_axis_needs_mirror(cms, masks, tileState->uls, tileState->lrs);
+        const bool newMirrorT = gfx_texture_axis_needs_mirror(cmt, maskt, tileState->ult, tileState->lrt);
         bool descriptorChanged = (tileState->fmt != fmt) || (tileState->siz != siz) ||
                                  (tileState->palette != palette) ||
                                  (tileState->cms != cms) || (tileState->cmt != cmt) ||
@@ -4929,10 +5292,10 @@ static void gfx_dp_set_tile_size(uint8_t tile, uint16_t uls, uint16_t ult, uint1
 
     if (gfx_get_render_tile_slot(tile, &renderSlot)) {
         TextureTileState* tileState = gfx_get_texture_tile(renderSlot);
-        const uint16_t oldSpanS = tileState->lrs - tileState->uls;
-        const uint16_t oldSpanT = tileState->lrt - tileState->ult;
-        const uint16_t newSpanS = lrs - uls;
-        const uint16_t newSpanT = lrt - ult;
+        const uint16_t oldSpanS = gfx_texture_tile_span(tileState->uls, tileState->lrs);
+        const uint16_t oldSpanT = gfx_texture_tile_span(tileState->ult, tileState->lrt);
+        const uint16_t newSpanS = gfx_texture_tile_span(uls, lrs);
+        const uint16_t newSpanT = gfx_texture_tile_span(ult, lrt);
 
         if ((tileState->uls == uls) && (tileState->ult == ult) &&
             (tileState->lrs == lrs) && (tileState->lrt == lrt)) {
@@ -5103,6 +5466,7 @@ static void gfx_dp_load_block(uint8_t tile, uint32_t uls, uint32_t ult, uint32_t
                                                 size_bytes, 0, 0);
 #endif
     rdp.loaded_texture[loadSlot].size_bytes = size_bytes;
+    rdp.loaded_texture[loadSlot].shadow = rdp.texture_to_load.shadow;
     rdp.loaded_texture[loadSlot].source_size_bytes = size_bytes;
     rdp.loaded_texture[loadSlot].row_stride_bytes = 0;
     rdp.loaded_texture[loadSlot].source_nibble_offset = 0;
@@ -5174,6 +5538,7 @@ static void gfx_dp_load_tile(uint8_t tile, uint32_t uls, uint32_t ult, uint32_t 
     uint32_t row_bytes = gfx_texture_row_bytes(width + (rdp.texture_to_load.siz == G_IM_SIZ_4b ? (source_uls & 1) : 0),
                                                rdp.texture_to_load.siz);
     uint32_t size_bytes = row_bytes * height;
+    rdp.loaded_texture[loadSlot].shadow = NULL;
     uint32_t source_size_bytes = height > 0 ? ((height - 1) * source_stride) + row_bytes : 0;
     const uint8_t* source_addr = rdp.texture_to_load.addr + (size_t)source_ult * source_stride + source_x_offset;
 #if defined(TARGET_PSP)
@@ -5271,12 +5636,12 @@ static bool gfx_cc_is_two_cycle_texture_shade_prim_tint(uint32_t a0, uint32_t b0
            (c1 == G_CCMUX_COMBINED) && (d1 == G_CCMUX_PRIMITIVE);
 }
 
-static bool gfx_cc_is_two_cycle_texture_blend_mul_shade(uint32_t a0, uint32_t b0, uint32_t c0, uint32_t d0,
+static bool gfx_cc_is_two_cycle_texture_blend_mul_color(uint32_t a0, uint32_t b0, uint32_t c0, uint32_t d0,
                                                         uint32_t a1, uint32_t b1, uint32_t c1, uint32_t d1,
                                                         uint32_t mixSource) {
     return (a0 == G_CCMUX_TEXEL1) && (b0 == G_CCMUX_TEXEL0) && (c0 == mixSource) &&
            (d0 == G_CCMUX_TEXEL0) && (a1 == G_CCMUX_COMBINED) && (b1 == (G_CCMUX_0 & 0xF)) &&
-           (c1 == G_CCMUX_SHADE) && (d1 == (G_CCMUX_0 & 0x7));
+           ((c1 == G_CCMUX_SHADE) || (c1 == G_CCMUX_PRIMITIVE)) && (d1 == (G_CCMUX_0 & 0x7));
 }
 
 static bool gfx_cc_is_two_texture_multiply_mul_shade(uint32_t a0, uint32_t b0, uint32_t c0, uint32_t d0,
@@ -5418,10 +5783,12 @@ static void gfx_dp_set_combine_mode(uint32_t rgb, uint32_t alpha, bool color_mul
                                     bool two_texture_multiply, bool two_texture_blend_uses_prim_lod,
                                     bool two_texture_alpha_blend, bool alpha_mul_env, bool flame_texture_atlas,
                                     bool texture_tint_uses_prim_lod,
-                                    bool texture_tint_uses_env_alpha) {
+                                    bool texture_tint_uses_env_alpha, bool arrow_glow, bool texture_add) {
     uint32_t combineMode = rgb | (alpha << 12);
 
-    if (texture_blend) {
+    if (texture_add) {
+        combineMode |= SHADER_OPT_TEXTURE_ADD;
+    } else if (texture_blend) {
         combineMode |= texture_blend_shade ? SHADER_OPT_TEXTURE_BLEND_SHADE : SHADER_OPT_TEXTURE_BLEND;
     }
     if ((rdp.combine_mode == combineMode) && (rdp.combine_color_mul_env == color_mul_env) &&
@@ -5430,6 +5797,7 @@ static void gfx_dp_set_combine_mode(uint32_t rgb, uint32_t alpha, bool color_mul
         (rdp.combine_two_texture_multiply == two_texture_multiply) &&
         (rdp.combine_two_texture_blend_uses_prim_lod == two_texture_blend_uses_prim_lod) &&
         (rdp.combine_two_texture_alpha_blend == two_texture_alpha_blend) &&
+        (rdp.combine_arrow_glow == arrow_glow) &&
         (rdp.combine_alpha_mul_env == alpha_mul_env) &&
         (rdp.combine_flame_texture_atlas == flame_texture_atlas) &&
         (rdp.combine_texture_tint_uses_prim_lod == texture_tint_uses_prim_lod) &&
@@ -5443,6 +5811,7 @@ static void gfx_dp_set_combine_mode(uint32_t rgb, uint32_t alpha, bool color_mul
     rdp.combine_two_texture_multiply = two_texture_multiply;
     rdp.combine_two_texture_blend_uses_prim_lod = two_texture_blend_uses_prim_lod;
     rdp.combine_two_texture_alpha_blend = two_texture_alpha_blend;
+    rdp.combine_arrow_glow = arrow_glow;
     rdp.combine_alpha_mul_env = alpha_mul_env;
     rdp.combine_flame_texture_atlas = flame_texture_atlas;
     rdp.combine_texture_tint_uses_prim_lod = texture_tint_uses_prim_lod;
@@ -5451,10 +5820,13 @@ static void gfx_dp_set_combine_mode(uint32_t rgb, uint32_t alpha, bool color_mul
 }
 
 static GFX_DL_HANDLER void gfx_dp_set_combine(uint32_t w0, uint32_t w1) {
+    const uint32_t cycleType = rdp.other_mode_h & (3U << G_MDSFT_CYCLETYPE);
+    if (rdp.combine_w0 != w0 || rdp.combine_w1 != w1 || rdp.combine_cycle_type != cycleType) {
+        gfx_mark_tri_pipeline_dirty();
+    }
     rdp.combine_w0 = w0;
     rdp.combine_w1 = w1;
-    rdp.combine_cycle_type = rdp.other_mode_h & (3U << G_MDSFT_CYCLETYPE);
-    gfx_mark_tri_pipeline_dirty();
+    rdp.combine_cycle_type = cycleType;
 #define COMB_FIELD(word, pos, width) (((word) >> (pos)) & ((1U << (width)) - 1))
     uint32_t rgbA0 = COMB_FIELD(w0, 20, 4);
     uint32_t rgbB0 = COMB_FIELD(w1, 28, 4);
@@ -5499,6 +5871,8 @@ static GFX_DL_HANDLER void gfx_dp_set_combine(uint32_t w0, uint32_t w1) {
     bool twoTextureMultiply = false;
     bool twoTextureBlendUsesPrimLod = false;
     bool twoTextureAlphaBlend = false;
+    bool arrowGlow = false;
+    bool textureAdd = false;
     bool alphaMulEnv = false;
     bool flameTextureAtlas = false;
     bool textureTintUsesPrimLod = false;
@@ -5508,6 +5882,22 @@ static GFX_DL_HANDLER void gfx_dp_set_combine(uint32_t w0, uint32_t w1) {
     uint32_t alphaComb = color_comb(alphaA0, alphaB0, alphaC0, alphaD0);
 
 #if defined(TARGET_PSP)
+    if ((rgbA0 == G_CCMUX_1) && (rgbB0 == (G_CCMUX_0 & 0xF)) &&
+        (rgbC0 == G_CCMUX_PRIMITIVE) && (rgbD0 == G_CCMUX_TEXEL0) &&
+        (alphaA0 == G_ACMUX_0) && (alphaB0 == G_ACMUX_0) &&
+        (alphaC0 == G_ACMUX_0) && (alphaD0 == G_ACMUX_TEXEL0) &&
+        (((rdp.other_mode_h & (3U << G_MDSFT_CYCLETYPE)) == G_CYC_1CYCLE) ||
+         ((rgbA1 == (G_CCMUX_0 & 0xF)) && (rgbB1 == (G_CCMUX_0 & 0xF)) &&
+          (rgbC1 == G_CCMUX_0) && (rgbD1 == G_CCMUX_COMBINED) &&
+          (alphaA1 == G_ACMUX_0) && (alphaB1 == G_ACMUX_0) &&
+          (alphaC1 == G_ACMUX_0) && (alphaD1 == G_ACMUX_COMBINED)))) {
+        /* A regular bomb adds its animated PRIMITIVE red to the IA8 body
+         * texture. GU implements that addition directly, including RGB
+         * saturation and the texture's independent alpha silhouette. */
+        rgbComb = color_comb(G_CCMUX_TEXEL0, G_CCMUX_0, G_CCMUX_PRIMITIVE, G_CCMUX_0);
+        textureAdd = true;
+    }
+
     /*
      * The compact PSP combiner has no representation for the constant-one input. Canonicalize
      * (1 - 0) * source + 0 to source before that input is discarded. UI masks such as the ocarina
@@ -5541,11 +5931,11 @@ static GFX_DL_HANDLER void gfx_dp_set_combine(uint32_t w0, uint32_t w1) {
         alphaComb = color_comb(G_ACMUX_0, G_ACMUX_0, G_ACMUX_0, G_ACMUX_PRIMITIVE);
     }
 
-    if (gfx_cc_is_two_cycle_texture_blend_mul_shade(rgbA0, rgbB0, rgbC0, rgbD0, rgbA1, rgbB1, rgbC1,
+    if (gfx_cc_is_two_cycle_texture_blend_mul_color(rgbA0, rgbB0, rgbC0, rgbD0, rgbA1, rgbB1, rgbC1,
                                                     rgbD1, G_CCMUX_ENV_ALPHA) ||
-        gfx_cc_is_two_cycle_texture_blend_mul_shade(rgbA0, rgbB0, rgbC0, rgbD0, rgbA1, rgbB1, rgbC1,
+        gfx_cc_is_two_cycle_texture_blend_mul_color(rgbA0, rgbB0, rgbC0, rgbD0, rgbA1, rgbB1, rgbC1,
                                                     rgbD1, G_CCMUX_LOD_FRACTION) ||
-        gfx_cc_is_two_cycle_texture_blend_mul_shade(rgbA0, rgbB0, rgbC0, rgbD0, rgbA1, rgbB1, rgbC1,
+        gfx_cc_is_two_cycle_texture_blend_mul_color(rgbA0, rgbB0, rgbC0, rgbD0, rgbA1, rgbB1, rgbC1,
                                                     rgbD1, G_CCMUX_PRIM_LOD_FRAC)) {
         twoTextureBlend = true;
         /* The PSP has no RDP LOD/tile combiner. OoT's fixed two-tile materials
@@ -5553,7 +5943,10 @@ static GFX_DL_HANDLER void gfx_dp_set_combine(uint32_t w0, uint32_t w1) {
          * the blend factor for the two GU passes. */
         twoTextureBlendUsesPrimLod = (rgbC0 == G_CCMUX_LOD_FRACTION) ||
                                      (rgbC0 == G_CCMUX_PRIM_LOD_FRAC);
-        rgbComb = color_comb(G_CCMUX_TEXEL0, G_CCMUX_0, G_CCMUX_SHADE, G_CCMUX_0);
+        /* Temple of Time floors use both SHADE and PRIMITIVE variants of
+         * this crossfade. Preserve the multiplier instead of losing the
+         * second texture (or replacing its blue lighting with vertex RGB). */
+        rgbComb = color_comb(G_CCMUX_TEXEL0, G_CCMUX_0, rgbC1, G_CCMUX_0);
         if (gfx_cc_is_combined_mul_primitive(alphaA1, alphaB1, alphaC1, alphaD1)) {
             alphaComb = color_comb(G_ACMUX_0, G_ACMUX_0, G_ACMUX_0, G_ACMUX_PRIMITIVE);
         }
@@ -5604,6 +5997,61 @@ static GFX_DL_HANDLER void gfx_dp_set_combine(uint32_t w0, uint32_t w1) {
         } else if (gfx_cc_is_one(alphaA1, alphaB1, alphaC1, alphaD1)) {
             alphaComb = color_comb(G_ACMUX_0, G_ACMUX_0, G_ACMUX_0, G_ACMUX_1);
         }
+        textureBlend = true;
+
+        if (((rdp.other_mode_h & (3U << G_MDSFT_CYCLETYPE)) == G_CYC_2CYCLE) &&
+            (rgbA0 == G_CCMUX_TEXEL1) && (rgbB0 == G_CCMUX_PRIMITIVE) &&
+            (rgbC0 == G_CCMUX_ENV_ALPHA) &&
+            (alphaA0 == G_ACMUX_TEXEL1) &&
+            ((alphaB0 == G_ACMUX_1) || (alphaB0 == G_ACMUX_0)) &&
+            (alphaC0 == G_ACMUX_ENVIRONMENT) && (alphaD0 == G_ACMUX_TEXEL0) &&
+            gfx_cc_is_combined_mul_primitive(alphaA1, alphaB1, alphaC1, alphaD1)) {
+            /* Fire, ice and light arrows add two independently scrolling
+             * intensity masks before tinting them. Approximate that coverage
+             * with the GU's two translucent passes, retaining both masks and
+             * the animated primitive opacity. The single-map fallback loses
+             * the surrounding shimmer, especially on the ice arrow. */
+            twoTextureBlend = true;
+            twoTextureAlphaBlend = true;
+            arrowGlow = true;
+        }
+    }
+
+    if (((rdp.other_mode_h & (3U << G_MDSFT_CYCLETYPE)) == G_CYC_2CYCLE) &&
+        (rgbA0 == G_CCMUX_TEXEL0) && (rgbB0 == G_CCMUX_SHADE) &&
+        (rgbC0 == G_CCMUX_PRIM_LOD_FRAC) && (rgbD0 == G_CCMUX_ENVIRONMENT) &&
+        (rgbA1 == G_CCMUX_PRIMITIVE) && (rgbB1 == G_CCMUX_ENVIRONMENT) &&
+        (rgbC1 == G_CCMUX_COMBINED) && (rgbD1 == G_CCMUX_ENVIRONMENT) &&
+        gfx_cc_is_one(alphaA0, alphaB0, alphaC0, alphaD0) &&
+        gfx_cc_is_one(alphaA1, alphaB1, alphaC1, alphaD1)) {
+        /* Odd Mushroom/Potion shells use (TEXEL0-SHADE)*PRIM_LOD_FRAC+ENV,
+         * then tint that result between ENV and PRIM. The compact combiner
+         * has no PRIM_LOD_FRAC input: it otherwise discards TEXEL0 entirely
+         * and renders a flat ENV color. Retain the generated reflection map
+         * with a GU tint approximation. The subtractive lighting equation
+         * cannot be expressed by GU's single texture/color operation. */
+        rgbComb = color_comb(G_CCMUX_TEXEL0, G_CCMUX_0, G_CCMUX_PRIMITIVE, G_CCMUX_0);
+        /* Both item display lists set primitive alpha to 255. Keep the I8
+         * reflection out of alpha, including in their texture-edge mode. */
+        alphaComb = color_comb(G_ACMUX_0, G_ACMUX_0, G_ACMUX_0, G_ACMUX_PRIMITIVE);
+        textureBlend = true;
+    }
+
+    if (((rdp.other_mode_h & (3U << G_MDSFT_CYCLETYPE)) == G_CYC_2CYCLE) &&
+        (rgbA0 == G_CCMUX_TEXEL0) && (rgbB0 == (G_CCMUX_0 & 0xF)) &&
+        (rgbC0 == G_CCMUX_ENV_ALPHA) && (rgbD0 == G_CCMUX_TEXEL1) &&
+        (rgbA1 == G_CCMUX_PRIMITIVE) && (rgbB1 == G_CCMUX_ENVIRONMENT) &&
+        (rgbC1 == G_CCMUX_COMBINED) && (rgbD1 == G_CCMUX_ENVIRONMENT) &&
+        (alphaA0 == G_ACMUX_TEXEL0) && (alphaB0 == G_ACMUX_1) &&
+        (alphaC0 == G_ACMUX_ENVIRONMENT) && (alphaD0 == G_ACMUX_TEXEL1) &&
+        gfx_cc_is_combined_mul_primitive(alphaA1, alphaB1, alphaC1, alphaD1)) {
+        /* Freezard breath uses TEXEL1 as the soft cloud silhouette. The
+         * compact combiner drops its subtractive coverage equation and
+         * exposes the billboard triangle. Use that silhouette directly on
+         * GU, retaining tint and per-particle fade instead of adding the
+         * scrolling TEXEL0 noise outside the cloud. */
+        rgbComb = color_comb(G_CCMUX_TEXEL1, G_CCMUX_0, G_CCMUX_PRIMITIVE, G_CCMUX_0);
+        alphaComb = color_comb(G_ACMUX_TEXEL1, G_ACMUX_0, G_ACMUX_PRIMITIVE, G_ACMUX_0);
         textureBlend = true;
     }
 
@@ -5695,7 +6143,7 @@ static GFX_DL_HANDLER void gfx_dp_set_combine(uint32_t w0, uint32_t w1) {
                             twoTextureBlend, twoTextureMultiply, twoTextureBlendUsesPrimLod,
                             twoTextureAlphaBlend, alphaMulEnv, flameTextureAtlas,
                             textureTintUsesPrimLod || singleTexturePrimLodTint,
-                            singleTextureEnvAlphaTint);
+                            singleTextureEnvAlphaTint, arrowGlow, textureAdd);
 #undef COMB_FIELD
 }
 
@@ -5787,11 +6235,7 @@ static void gfx_draw_rectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t lr
         lryf = gfx_current_dimensions.height;
     } else {
         const float halfWidth = (float)gfx_current_dimensions.width * 0.5f;
-        const float halfHeight = (float)gfx_current_dimensions.height * 0.5f;
         const float hudOffset = gfx_hud_anchor_offset_pixels();
-
-        ulyf = (ulyf / (4.0f * HALF_SCREEN_HEIGHT)) - 1.0f;
-        lryf = (lryf / (4.0f * HALF_SCREEN_HEIGHT)) - 1.0f;
 
         if (force_full_width) {
             ulxf = 0.0f;
@@ -5805,8 +6249,10 @@ static void gfx_draw_rectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t lr
             lrxf = (lrxf * halfWidth) + halfWidth + hudOffset;
         }
 
-        ulyf = (ulyf * halfHeight) + halfHeight;
-        lryf = (lryf * halfHeight) + halfHeight;
+        /* Use the same endpoint mapping as SetScissor. Passing through NDC
+         * first introduces cancellation at exact integer pixel boundaries. */
+        ulyf = ulyf * gfx_current_dimensions.height / (8.0f * HALF_SCREEN_HEIGHT);
+        lryf = lryf * gfx_current_dimensions.height / (8.0f * HALF_SCREEN_HEIGHT);
     }
     
     struct VertexColor* ul = &rsp.loaded_vertices_2D[0];
@@ -5818,14 +6264,14 @@ static void gfx_draw_rectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t lr
     lr->x = (unsigned short)lrxf;
     lr->y = (unsigned short)lryf;
 
-    // The coordinates for texture rectangles shall bypass the 3D viewport/scissor state.
+    /* RDP rectangles bypass the RSP viewport, but still obey the RDP scissor.
+     * The skybox fog filter uses a screen-sized rectangle with the letterbox
+     * scissor active; expanding that scissor colors the edges of the bars. */
     struct XYWidthHeight default_viewport = {0, 0, gfx_current_dimensions.width, gfx_current_dimensions.height};
     struct XYWidthHeight viewport_saved = rdp.viewport;
-    struct XYWidthHeight scissor_saved = rdp.scissor;
     uint32_t geometry_mode_saved = rsp.geometry_mode;
     
     rdp.viewport = default_viewport;
-    rdp.scissor = default_viewport;
     rdp.viewport_or_scissor_changed = true;
     /* RDP rectangles do not use RSP geometry flags, but GU only writes the
      * depth buffer while its depth unit is enabled. Preserve depth processing
@@ -5837,7 +6283,6 @@ static void gfx_draw_rectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t lr
     
     rsp.geometry_mode = geometry_mode_saved;
     rdp.viewport = viewport_saved;
-    rdp.scissor = scissor_saved;
     rdp.viewport_or_scissor_changed = true;
     gfx_mark_tri_pipeline_dirty();
     
@@ -5916,6 +6361,7 @@ static void gfx_dp_texture_rectangle(int32_t ulx, int32_t uly, int32_t lrx, int3
     bool saved_combine_two_texture_multiply = rdp.combine_two_texture_multiply;
     bool saved_combine_two_texture_blend_uses_prim_lod = rdp.combine_two_texture_blend_uses_prim_lod;
     bool saved_combine_two_texture_alpha_blend = rdp.combine_two_texture_alpha_blend;
+    bool saved_combine_arrow_glow = rdp.combine_arrow_glow;
     bool saved_combine_alpha_mul_env = rdp.combine_alpha_mul_env;
     bool saved_combine_flame_texture_atlas = rdp.combine_flame_texture_atlas;
     bool saved_combine_texture_tint_uses_prim_lod = rdp.combine_texture_tint_uses_prim_lod;
@@ -5927,7 +6373,7 @@ static void gfx_dp_texture_rectangle(int32_t ulx, int32_t uly, int32_t lrx, int3
         
         // Color combiner is turned off in copy mode
         gfx_dp_set_combine_mode(color_comb(0, 0, 0, G_CCMUX_TEXEL0), color_comb(0, 0, 0, G_ACMUX_TEXEL0),
-                                false, false, false, false, false, false, false, false, false, false, false, false);
+                                false, false, false, false, false, false, false, false, false, false, false, false, false, false);
         
         // Per documentation one extra pixel is added in this modes to each edge
         lrx += 1 << 2;
@@ -6020,6 +6466,7 @@ static void gfx_dp_texture_rectangle(int32_t ulx, int32_t uly, int32_t lrx, int3
     rdp.combine_two_texture_multiply = saved_combine_two_texture_multiply;
     rdp.combine_two_texture_blend_uses_prim_lod = saved_combine_two_texture_blend_uses_prim_lod;
     rdp.combine_two_texture_alpha_blend = saved_combine_two_texture_alpha_blend;
+    rdp.combine_arrow_glow = saved_combine_arrow_glow;
     rdp.combine_alpha_mul_env = saved_combine_alpha_mul_env;
     rdp.combine_flame_texture_atlas = saved_combine_flame_texture_atlas;
     rdp.combine_texture_tint_uses_prim_lod = saved_combine_texture_tint_uses_prim_lod;
@@ -6053,13 +6500,14 @@ static void gfx_dp_fill_rectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t
     bool saved_combine_two_texture_multiply = rdp.combine_two_texture_multiply;
     bool saved_combine_two_texture_blend_uses_prim_lod = rdp.combine_two_texture_blend_uses_prim_lod;
     bool saved_combine_two_texture_alpha_blend = rdp.combine_two_texture_alpha_blend;
+    bool saved_combine_arrow_glow = rdp.combine_arrow_glow;
     bool saved_combine_alpha_mul_env = rdp.combine_alpha_mul_env;
     bool saved_combine_flame_texture_atlas = rdp.combine_flame_texture_atlas;
     bool saved_combine_texture_tint_uses_prim_lod = rdp.combine_texture_tint_uses_prim_lod;
     bool saved_combine_texture_tint_uses_env_alpha = rdp.combine_texture_tint_uses_env_alpha;
     if (use_fill_color) {
         gfx_dp_set_combine_mode(color_comb(0, 0, 0, G_CCMUX_SHADE), color_comb(0, 0, 0, G_ACMUX_SHADE),
-                                false, false, false, false, false, false, false, false, false, false, false, false);
+                                false, false, false, false, false, false, false, false, false, false, false, false, false, false);
     }
     gfx_draw_rectangle(ulx, uly, lrx, lry, gfx_rectangle_covers_screen(ulx, uly, lrx, lry),
                        gfx_rectangle_covers_width(ulx, lrx));
@@ -6071,6 +6519,7 @@ static void gfx_dp_fill_rectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t
         rdp.combine_two_texture_multiply = saved_combine_two_texture_multiply;
         rdp.combine_two_texture_blend_uses_prim_lod = saved_combine_two_texture_blend_uses_prim_lod;
         rdp.combine_two_texture_alpha_blend = saved_combine_two_texture_alpha_blend;
+        rdp.combine_arrow_glow = saved_combine_arrow_glow;
         rdp.combine_alpha_mul_env = saved_combine_alpha_mul_env;
         rdp.combine_flame_texture_atlas = saved_combine_flame_texture_atlas;
         rdp.combine_texture_tint_uses_prim_lod = saved_combine_texture_tint_uses_prim_lod;
@@ -6110,6 +6559,12 @@ static void gfx_dp_set_other_mode(uint32_t mode_h, uint32_t mode_l) {
     rdp.other_mode_h = mode_h;
     rdp.other_mode_l = mode_l;
     gfx_mark_tri_pipeline_dirty();
+}
+
+static void gfx_set_fog_projection(const OotPspFogProjection* projection) {
+    /* Fog is captured at vertex load, like G_MW_FOG. Keep raw N64 factors in
+     * rsp so actor/room overrides receive the same projection correction. */
+    sFogProjection = projection != NULL ? *projection : (OotPspFogProjection){ 1.0f, 0.0f };
 }
 
 static void gfx_dp_noop(uint32_t tag) {
@@ -6633,6 +7088,7 @@ static GFX_DL_HANDLER void gfx_sp_s2dex_bg_rect(uint32_t opcode, const void* bgA
     bool savedTwoTextureMultiply;
     bool savedTwoTextureBlendUsesPrimLod;
     bool savedTwoTextureAlphaBlend;
+    bool savedArrowGlow;
     bool savedAlphaMulEnv;
     bool savedFlameTextureAtlas;
     bool savedTextureTintUsesPrimLod;
@@ -6685,13 +7141,14 @@ static GFX_DL_HANDLER void gfx_sp_s2dex_bg_rect(uint32_t opcode, const void* bgA
     savedTwoTextureMultiply = rdp.combine_two_texture_multiply;
     savedTwoTextureBlendUsesPrimLod = rdp.combine_two_texture_blend_uses_prim_lod;
     savedTwoTextureAlphaBlend = rdp.combine_two_texture_alpha_blend;
+    savedArrowGlow = rdp.combine_arrow_glow;
     savedAlphaMulEnv = rdp.combine_alpha_mul_env;
     savedFlameTextureAtlas = rdp.combine_flame_texture_atlas;
     savedTextureTintUsesPrimLod = rdp.combine_texture_tint_uses_prim_lod;
     savedTextureTintUsesEnvAlpha = rdp.combine_texture_tint_uses_env_alpha;
     if ((rdp.other_mode_h & (3U << G_MDSFT_CYCLETYPE)) == G_CYC_COPY) {
         gfx_dp_set_combine_mode(color_comb(0, 0, 0, G_CCMUX_TEXEL0), color_comb(0, 0, 0, G_ACMUX_TEXEL0),
-                                false, false, false, false, false, false, false, false, false, false, false, false);
+                                false, false, false, false, false, false, false, false, false, false, false, false, false, false);
     }
 
     gfx_draw_rectangle(frameX, frameY, frameX + frameW, frameY + frameH, false, false);
@@ -6703,6 +7160,7 @@ static GFX_DL_HANDLER void gfx_sp_s2dex_bg_rect(uint32_t opcode, const void* bgA
     rdp.combine_two_texture_multiply = savedTwoTextureMultiply;
     rdp.combine_two_texture_blend_uses_prim_lod = savedTwoTextureBlendUsesPrimLod;
     rdp.combine_two_texture_alpha_blend = savedTwoTextureAlphaBlend;
+    rdp.combine_arrow_glow = savedArrowGlow;
     rdp.combine_alpha_mul_env = savedAlphaMulEnv;
     rdp.combine_flame_texture_atlas = savedFlameTextureAtlas;
     rdp.combine_texture_tint_uses_prim_lod = savedTextureTintUsesPrimLod;
@@ -6740,6 +7198,281 @@ static bool gfx_translate_dl_cursor(Gfx** cmdP) {
 
 #define C0(pos, width) ((cmd->words.w0 >> (pos)) & ((1U << width) - 1))
 #define C1(pos, width) ((cmd->words.w1 >> (pos)) & ((1U << width) - 1))
+
+/* Native mesh cache deliberately accepts only a state-free F3DEX2 suffix:
+ * VTX/TRI1/TRI2/ENDDL, immutable packed assets, unlit SHADE with at most one immutable texture.
+ * No command or asset pointer is read again on a hit. Material changes before
+ * the suffix continue through the normal interpreter/pipeline state cache. */
+#ifndef OOT_PSP_NATIVE_MESH_ENTRIES
+#define OOT_PSP_NATIVE_MESH_ENTRIES 8
+#endif
+#define NATIVE_MESH_VERTICES 128
+#define NATIVE_MESH_INDICES 768
+#if defined(TARGET_PSP) && defined(F3DEX_GBI_2) && OOT_PSP_NATIVE_MESH_ENTRIES > 0
+extern void gfx_scegu_draw_native_mesh(const void* vertices, const uint16_t* indices,
+                                      unsigned int count, const float model[4][4], uint32_t cull);
+struct NativeMaterial {
+    const uint8_t* texture;
+    uint32_t geometry_mode, white_alpha;
+    float u_scale, v_scale, u_bias, v_bias;
+    uint16_t s, t;
+};
+struct NativeMesh {
+    const Gfx* commands;
+    Gfx* end;
+    uint32_t generation;
+    struct NativeMaterial material;
+    uintptr_t segments[4];
+    uint64_t written;
+    uint16_t final[MAX_VERTICES];
+    uint16_t vertex_count, index_count;
+    bool pinned, valid;
+    uint8_t pending_groups;
+    float min[3], max[3];
+    Vtx source[NATIVE_MESH_VERTICES];
+    psp_fast_t vertices[NATIVE_MESH_VERTICES] __attribute__((aligned(16)));
+    uint16_t indices[NATIVE_MESH_INDICES] __attribute__((aligned(16)));
+};
+static struct NativeMesh sNativeMeshes[OOT_PSP_NATIVE_MESH_ENTRIES] __attribute__((aligned(64)));
+static unsigned int sNativeMeshVictim;
+/* RSP vertex loads have observable effects after ENDDL. Retain only the final
+ * slot contents and load-time state, separately from immutable mesh storage.
+ * A later VTX discards overwritten slots; only a fallback reader transforms
+ * surviving slots. At most 64 disjoint nonempty groups can exist. */
+static struct NativePending {
+    uint64_t mask;
+    struct NativeMesh* mesh;
+    float model[4][4], projection[4][4];
+    float aspect;
+    uint16_t s, t;
+} sNativePending[MAX_VERTICES] __attribute__((aligned(16)));
+static uint64_t sNativePendingMask;
+
+static void gfx_native_forget(uint64_t mask) {
+    if (!(sNativePendingMask & mask)) return;
+    sNativePendingMask &= ~mask;
+    for (unsigned int i = 0; i < MAX_VERTICES; i++) {
+        struct NativePending* p = &sNativePending[i];
+        if (!p->mask) continue;
+        p->mask &= ~mask;
+        if (!p->mask) p->mesh->pending_groups--;
+    }
+}
+
+static void gfx_native_materialize(uint64_t mask) {
+    if (!(sNativePendingMask & mask)) return;
+    sNativePendingMask &= ~mask;
+    for (unsigned int i = 0; i < MAX_VERTICES; i++) {
+        struct NativePending* p = &sNativePending[i];
+        uint64_t needed = p->mask & mask;
+        if (!needed) continue;
+        const struct GfxVfpuTransformState state = { p->model, p->projection, 0, 0, 0, 0 };
+        for (unsigned int j = 0; j < MAX_VERTICES; j++) {
+            if (!(needed & (UINT64_C(1) << j))) continue;
+            struct LoadedVertex* d = &rsp.loaded_vertices[j];
+            const Vtx* source = &p->mesh->source[p->mesh->final[j]];
+            const Vtx_t* v = &source->v;
+            gfx_transform_vertices_vfpu(d, source, 1, &state);
+            d->_x *= p->aspect;
+            d->w = d->_w;
+            d->u = (int16_t)((v->tc[0] * p->s) >> 16);
+            d->v = (int16_t)((v->tc[1] * p->t) >> 16);
+            memcpy(&d->color, v->cn, sizeof(d->color));
+            d->lighting = 0;
+            d->decal_lifted = 0;
+            d->clip_rej = 0;
+            if (d->_x < -d->_w) d->clip_rej |= X_POS;
+            if (d->_x > d->_w) d->clip_rej |= X_NEG;
+            if (d->_y < -d->_w) d->clip_rej |= Y_POS;
+            if (d->_y > d->_w) d->clip_rej |= Y_NEG;
+            if (d->_z < -d->_w) d->clip_rej |= Z_POS;
+            if (d->_z > d->_w) d->clip_rej |= Z_NEG;
+        }
+        p->mask &= ~needed;
+        if (!p->mask) p->mesh->pending_groups--;
+    }
+}
+
+static bool gfx_native_immutable(const void* ptr, size_t size) {
+    uint32_t flags;
+    const uint32_t required = OOT_PSP_EXTERNAL_ASSET_NATIVE | OOT_PSP_EXTERNAL_ASSET_IMMUTABLE_MESH;
+    return OotPsp_GetLoadedExternalAssetRangeFlags(ptr, size, &flags) && (flags & required) == required;
+}
+
+static bool gfx_native_build(struct NativeMesh* mesh, Gfx* cmd) {
+    uint16_t slots[MAX_VERTICES];
+    memset(slots, 0xff, sizeof(slots));
+    mesh->vertex_count = mesh->index_count = 0;
+    mesh->written = 0;
+    if (mesh->material.texture && !gfx_native_immutable(mesh->material.texture, rdp.loaded_texture[0].source_size_bytes)) return false;
+    for (unsigned int command = 0; command < 512; command++, cmd++) {
+        if (!gfx_native_immutable(cmd, sizeof(*cmd))) return false;
+        const uint32_t w0 = cmd->words.w0;
+        const unsigned int op = w0 >> 24;
+        if (op == G_VTX) {
+            uint32_t count, dest;
+            uintptr_t raw = cmd->words.w1;
+            /* Only object/keep mappings are part of this cache key. */
+            if (raw < PSP_NATIVE_ADDR_START && (raw >> 24) != 4 && (raw >> 24) != 6) return false;
+            if (!gfx_decode_vertex_cmd_f3dex2(w0, &count, &dest) ||
+                mesh->vertex_count + count > NATIVE_MESH_VERTICES) return false;
+            const Vtx* source = seg_addr(raw);
+            if (!gfx_native_immutable(source, count * sizeof(Vtx))) return false;
+            for (unsigned int j = 0; j < count; j++) {
+                unsigned int index = mesh->vertex_count++;
+                psp_fast_t* v = &mesh->vertices[index];
+                mesh->source[index] = source[j];
+                const struct NativeMaterial* m = &mesh->material;
+                v->u = (int16_t)((source[j].v.tc[0] * m->s) >> 16) * m->u_scale + m->u_bias;
+                v->v = (int16_t)((source[j].v.tc[1] * m->t) >> 16) * m->v_scale + m->v_bias;
+                memcpy(&v->color, source[j].v.cn, sizeof(v->color));
+                memset(v->normal, 0, sizeof(v->normal));
+                if (m->white_alpha) v->color.a = 255;
+                v->x = source[j].v.ob[0];
+                v->y = source[j].v.ob[1];
+                v->z = source[j].v.ob[2];
+                for (unsigned int axis = 0; axis < 3; axis++) {
+                    float value = source[j].v.ob[axis];
+                    if (index == 0 || value < mesh->min[axis]) mesh->min[axis] = value;
+                    if (index == 0 || value > mesh->max[axis]) mesh->max[axis] = value;
+                }
+                slots[dest + j] = index;
+                mesh->written |= UINT64_C(1) << (dest + j);
+            }
+        } else if (op == G_TRI1 || op == G_TRI2) {
+            unsigned int count = op == G_TRI2 ? 6 : 3;
+            if (mesh->index_count + count > NATIVE_MESH_INDICES) return false;
+            for (unsigned int j = 0; j < count; j++) {
+                uint32_t packed = j < 3 ? w0 : cmd->words.w1;
+                unsigned int raw = (packed >> (16 - (j % 3) * 8)) & 255;
+                unsigned int slot = raw / 2;
+                if ((raw & 1) || slot >= MAX_VERTICES || slots[slot] == UINT16_MAX) return false;
+                mesh->indices[mesh->index_count++] = slots[slot];
+            }
+        } else if (op == (uint8_t)G_ENDDL && mesh->index_count) {
+            memcpy(mesh->final, slots, sizeof(slots));
+            mesh->end = cmd;
+            sceKernelDcacheWritebackRange(mesh->vertices, sizeof(mesh->vertices));
+            sceKernelDcacheWritebackRange(mesh->indices, sizeof(mesh->indices));
+            return true;
+        } else {
+            return false; /* Includes branches, matrices, MODIFYVTX and all state changes. */
+        }
+    }
+    return false;
+}
+
+static bool gfx_native_visible(const struct NativeMesh* mesh) {
+    /* PSP clipping differs at the near plane and large offscreen primitives.
+     * Test eight bounds corners, not every vertex; crossing meshes fall back. */
+    for (unsigned int i = 0; i < 8; i++) {
+        float v[4], model[4], clip[4];
+        for (unsigned int axis = 0; axis < 3; axis++) v[axis] = (i & (1 << axis)) ? mesh->max[axis] : mesh->min[axis];
+        v[3] = 1;
+        gfx_transform_vec4(model, rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1], v);
+        gfx_transform_vec4(clip, rsp.P_matrix, model);
+        const float w = clip[3];
+        if (!(w > 0.001f && fabsf(clip[0]) < w &&
+              fabsf(clip[1]) < w && fabsf(clip[2]) < w)) return false;
+    }
+    return true;
+}
+
+static GFX_DL_HANDLER bool gfx_native_try(Gfx** cursor) {
+    const uint32_t allowed = G_ZBUFFER | G_SHADE | G_SHADING_SMOOTH | G_CULL_FRONT | G_CULL_BACK;
+    if ((rsp.geometry_mode & ~allowed) || !(rsp.geometry_mode & G_SHADE) || gfx_hud_anchor_enabled()) return false;
+    /* Cheap rejection before touching the ordinary state preparer. */
+    if (rdp.combine_color_mul_env || rdp.combine_color_mul_prim || rdp.combine_alpha_mul_env ||
+        rdp.combine_two_texture_blend || rdp.combine_flame_texture_atlas ||
+        (rdp.other_mode_l & ZMODE_DEC) == ZMODE_DEC ||
+        (rdp.other_mode_l >> 30) == G_BL_CLR_FOG) return false;
+    gfx_prepare_tri_pipeline_state(false);
+    const struct TriPipelineState* state = &rendering_state.tri_pipeline;
+    if (state->use_fog || state->material_texture || state->texture_tint_colors_corrected ||
+        state->comb->vertex_color_source[0] != CC_SHADE ||
+        (state->use_alpha && state->comb->vertex_color_source[1] != CC_SHADE &&
+         state->comb->vertex_color_source[1] != CC_0) ||
+        (rsp.geometry_mode & G_CULL_BOTH) == G_CULL_BOTH) return false;
+    if (state->use_texture && (state->comb->used_textures[1] || rdp.texture_tile[0].fmt == G_IM_FMT_CI ||
+        !rdp.loaded_texture[0].source_size_bytes)) return false;
+    struct NativeMaterial material = {0};
+    material.geometry_mode = rsp.geometry_mode;
+    material.white_alpha = state->use_alpha && state->comb->vertex_color_source[1] == CC_0;
+    if (state->use_texture) {
+        material.texture = rdp.loaded_texture[0].addr;
+        material.u_scale = state->tex_u_scale[0];
+        material.v_scale = state->tex_v_scale[0];
+        material.u_bias = state->tex_u_bias[0];
+        material.v_bias = state->tex_v_bias[0];
+        material.s = rsp.texture_scaling_factor.s;
+        material.t = rsp.texture_scaling_factor.t;
+    }
+    const uint32_t generation = OotPsp_GetExternalAssetGeneration();
+    const uintptr_t segments[4] = { (uintptr_t)rsp.segments[4], (uintptr_t)rsp.segments[6], gSegments[4], gSegments[6] };
+    struct NativeMesh* mesh = NULL;
+    for (unsigned int i = 0; i < OOT_PSP_NATIVE_MESH_ENTRIES; i++) {
+        struct NativeMesh* candidate = &sNativeMeshes[i];
+        if (candidate->commands == *cursor && candidate->generation == generation &&
+            memcmp(candidate->segments, segments, sizeof(segments)) == 0 &&
+            memcmp(&candidate->material, &material, sizeof(material)) == 0) {
+            mesh = candidate;
+            break;
+        }
+    }
+    if (!mesh) {
+        for (unsigned int i = 0; i < OOT_PSP_NATIVE_MESH_ENTRIES; i++) {
+            struct NativeMesh* candidate = &sNativeMeshes[sNativeMeshVictim++ % OOT_PSP_NATIVE_MESH_ENTRIES];
+            if (!candidate->pinned && !candidate->pending_groups) { mesh = candidate; break; }
+        }
+        if (!mesh) return false;
+        mesh->commands = *cursor;
+        mesh->generation = generation;
+        mesh->material = material;
+        memcpy(mesh->segments, segments, sizeof(segments));
+        mesh->valid = gfx_native_build(mesh, *cursor);
+    }
+    const float (*model)[4] = rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1];
+    if (!mesh->valid || model[0][3] != 0 || model[1][3] != 0 || model[2][3] != 0 ||
+        model[3][3] != 1 || !gfx_native_visible(mesh)) return false;
+    gfx_flush();
+    gfx_apply_projection_matrix();
+    gfx_scegu_draw_native_mesh(mesh->vertices, mesh->indices, mesh->index_count,
+                              rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1], rsp.geometry_mode & G_CULL_BOTH);
+    mesh->pinned = true;
+#if defined(OOTDEBUG)
+    sPerformanceInputTriangleCount += mesh->index_count / 3;
+    sPerformanceOutputTriangleCount += mesh->index_count / 3;
+    sPerformanceDrawCallCount++;
+    if (rendering_state.alpha_blend) {
+        sPerformanceTranslucentDrawCallCount++;
+        sPerformanceTranslucentTriangleCount += mesh->index_count / 3;
+    } else {
+        sPerformanceOpaqueDrawCallCount++;
+        sPerformanceOpaqueTriangleCount += mesh->index_count / 3;
+    }
+    if (mesh->index_count / 3 > sPerformanceMaxBatchTriangles) sPerformanceMaxBatchTriangles = mesh->index_count / 3;
+#endif
+    gfx_native_forget(mesh->written);
+    sNativePendingMask |= mesh->written;
+    for (unsigned int i = 0; i < MAX_VERTICES; i++) {
+        if (sNativePending[i].mask) continue;
+        struct NativePending* p = &sNativePending[i];
+        p->mask = mesh->written;
+        p->mesh = mesh;
+        mesh->pending_groups++;
+        memcpy(p->model, rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1], sizeof(p->model));
+        memcpy(p->projection, rsp.P_matrix, sizeof(p->projection));
+        p->aspect = 1.0f; /* Native meshes use the unadjusted world projection. */
+        p->s = rsp.texture_scaling_factor.s;
+        p->t = rsp.texture_scaling_factor.t;
+        break;
+    }
+    *cursor = mesh->end; /* Execute ENDDL normally, preserving the return stack. */
+    return true;
+}
+#else
+#define gfx_native_try(cursor) false
+#endif
 
 static void gfx_run_dl(Gfx* cmd) {
 #define GFX_DL_RETURN_STACK_SIZE 64
@@ -6819,6 +7552,7 @@ static void gfx_run_dl(Gfx* cmd) {
                 }
                 break;
             case G_VTX:
+                if (gfx_native_try(&cmd)) continue;
 #ifdef F3DEX_GBI_2
 #if defined(TARGET_PSP)
                 if (!gfx_sp_vertex_f3dex2(cmd->words.w0, cmd->words.w1)) {
@@ -6945,7 +7679,14 @@ static void gfx_run_dl(Gfx* cmd) {
             
             // RDP Commands:
             case G_NOOP:
-                gfx_dp_noop(cmd->words.w1);
+                if ((cmd->words.w0 & 0x00ffffffU) == OOT_PSP_SHADOW_CMD) {
+                    gfx_flush();
+                    sPendingShadowMask = (const OotPspShadowMask*)seg_addr(cmd->words.w1);
+                } else if ((cmd->words.w0 & 0x00ffffffU) == OOT_PSP_FOG_PROJECTION_CMD) {
+                    gfx_set_fog_projection((const OotPspFogProjection*)seg_addr(cmd->words.w1));
+                } else {
+                    gfx_dp_noop(cmd->words.w1);
+                }
                 break;
             case G_RDPSETOTHERMODE:
                 gfx_dp_set_other_mode(cmd->words.w0 & 0x00FFFFFFU, cmd->words.w1);
@@ -7052,8 +7793,15 @@ static void gfx_run_dl(Gfx* cmd) {
 }
 
 static void gfx_sp_reset() {
+    sPendingShadowMask = NULL;
+    gfx_set_fog_projection(NULL);
+#if defined(TARGET_PSP) && defined(F3DEX_GBI_2) && OOT_PSP_NATIVE_MESH_ENTRIES > 0
+    /* Preserve the renderer's cross-run slot semantics before resetting RSP state. */
+    gfx_native_materialize(UINT64_MAX);
+#endif
     rsp.modelview_matrix_stack_size = 1;
     rsp.current_num_lights = 2;
+    sLightingStateDirty = true;
     rsp.lights_changed = true;
     rsp.rdp_half_1 = 0;
     sHudAnchor = OOT_PSP_HUD_ANCHOR_NONE;
@@ -7160,6 +7908,14 @@ struct GfxRenderingAPI *gfx_get_current_rendering_api(void) {
 void gfx_start_frame(void) {
     //sceIoWrite(1, "----START FRAME!\n", 18);
 #if defined(TARGET_PSP)
+    /* The previous tick's GE/presentation waits ran on the video thread while
+     * game logic built this display list. Fence before recycling render data. */
+    OotPspVideoThread_Wait();
+#if defined(F3DEX_GBI_2) && OOT_PSP_NATIVE_MESH_ENTRIES > 0
+    for (unsigned int i = 0; i < OOT_PSP_NATIVE_MESH_ENTRIES; i++) {
+        sNativeMeshes[i].pinned = false;
+    }
+#endif
     sTextureCacheFrameSerial++;
     if (sTextureCacheFrameSerial == 0) {
         sTextureCacheFrameSerial = 1;
@@ -7241,6 +7997,9 @@ void gfx_end_frame(void) {
 }
 
 void gfx_invalidate_render_state(void) {
+#if defined(TARGET_PSP)
+    OotPspVideoThread_Wait();
+#endif
     gfx_flush();
 
     if (gfx_rapi != NULL) {

@@ -12,15 +12,17 @@
  *     const struct GfxVfpuTransformState *state);
  *
  * Vtx is 16 bytes, with signed object coordinates at offsets 0, 2, and 4.
- * LoadedVertex is 48 bytes; its model and clip vectors start at 0 and 16.
+ * LoadedVertex is 64 bytes; its model and clip vectors start at 0 and 16.
+ * Its modelview-transformed normal starts at 48; GE normalizes it for lighting.
  * Matrices use the renderer's row-vector layout, so each VFPU dot product is
  * made against one matrix column. Surface alpha remains at offset 43. When
  * N64 fog is enabled, the separate fog alpha at offset 45 receives
- * clamp((clip_z / clip_w) * fog_mul + fog_offset, 0, 255).
+ * clamp((clip_z / clip_w) * fog_mul + fog_offset, 0, 255). The state carries
+ * float factors, including any correction for a shorter clipping near plane.
  */
 
 #define VTX_SIZE 16
-#define LOADED_VERTEX_SIZE 48
+#define LOADED_VERTEX_SIZE 64
 #define LOADED_VERTEX_MODEL_POS 0
 #define LOADED_VERTEX_CLIP_POS 16
 #define LOADED_VERTEX_ALPHA 43
@@ -29,6 +31,7 @@
 #define TRANSFORM_STATE_FOG_MUL 8
 #define TRANSFORM_STATE_FOG_OFFSET 12
 #define TRANSFORM_STATE_FOG_ENABLED 16
+#define TRANSFORM_STATE_LIGHTING_ENABLED 20
 
 .globl gfx_transform_vertices_vfpu
 gfx_transform_vertices_vfpu:
@@ -37,42 +40,62 @@ gfx_transform_vertices_vfpu:
 	lw      $t8, 0($a3)
 	lw      $t9, 4($a3)
 	lw      $t7, TRANSFORM_STATE_FOG_ENABLED($a3)
+	lw      $t6, TRANSFORM_STATE_LIGHTING_ENABLED($a3)
 
-	/* Model matrix columns. */
+	/* Matrices are normally 16-byte-aligned RSP state. Native deferred
+	 * vertices may supply only word alignment, so retain scalar loads for
+	 * those pointers. Load memory rows into VFPU columns, then address the
+	 * transposed row views in the dot products below. */
+	or      $t0, $t8, $t9
+	andi    $t0, $t0, 15
+	bne     $t0, $zero, .Lmatrix_scalar_load
+	nop
+	lv.q    C000, 0($t8)
+	lv.q    C010, 16($t8)
+	lv.q    C020, 32($t8)
+	lv.q    C030, 48($t8)
+	lv.q    C100, 0($t9)
+	lv.q    C110, 16($t9)
+	lv.q    C120, 32($t9)
+	lv.q    C130, 48($t9)
+	b       .Lmatrices_loaded
+	nop
+
+.Lmatrix_scalar_load:
 	lv.s    S000, 0($t8)
-	lv.s    S001, 16($t8)
-	lv.s    S002, 32($t8)
-	lv.s    S003, 48($t8)
-	lv.s    S010, 4($t8)
+	lv.s    S001, 4($t8)
+	lv.s    S002, 8($t8)
+	lv.s    S003, 12($t8)
+	lv.s    S010, 16($t8)
 	lv.s    S011, 20($t8)
-	lv.s    S012, 36($t8)
-	lv.s    S013, 52($t8)
-	lv.s    S020, 8($t8)
-	lv.s    S021, 24($t8)
+	lv.s    S012, 24($t8)
+	lv.s    S013, 28($t8)
+	lv.s    S020, 32($t8)
+	lv.s    S021, 36($t8)
 	lv.s    S022, 40($t8)
-	lv.s    S023, 56($t8)
-	lv.s    S030, 12($t8)
-	lv.s    S031, 28($t8)
-	lv.s    S032, 44($t8)
+	lv.s    S023, 44($t8)
+	lv.s    S030, 48($t8)
+	lv.s    S031, 52($t8)
+	lv.s    S032, 56($t8)
 	lv.s    S033, 60($t8)
-
-	/* Projection matrix columns. */
 	lv.s    S100, 0($t9)
-	lv.s    S101, 16($t9)
-	lv.s    S102, 32($t9)
-	lv.s    S103, 48($t9)
-	lv.s    S110, 4($t9)
+	lv.s    S101, 4($t9)
+	lv.s    S102, 8($t9)
+	lv.s    S103, 12($t9)
+	lv.s    S110, 16($t9)
 	lv.s    S111, 20($t9)
-	lv.s    S112, 36($t9)
-	lv.s    S113, 52($t9)
-	lv.s    S120, 8($t9)
-	lv.s    S121, 24($t9)
+	lv.s    S112, 24($t9)
+	lv.s    S113, 28($t9)
+	lv.s    S120, 32($t9)
+	lv.s    S121, 36($t9)
 	lv.s    S122, 40($t9)
-	lv.s    S123, 56($t9)
-	lv.s    S130, 12($t9)
-	lv.s    S131, 28($t9)
-	lv.s    S132, 44($t9)
+	lv.s    S123, 44($t9)
+	lv.s    S130, 48($t9)
+	lv.s    S131, 52($t9)
+	lv.s    S132, 56($t9)
 	lv.s    S133, 60($t9)
+
+.Lmatrices_loaded:
 
 	beq     $t7, $zero, .Ltransform_vertex
 	nop
@@ -80,8 +103,6 @@ gfx_transform_vertices_vfpu:
 	lw      $t1, TRANSFORM_STATE_FOG_OFFSET($a3)
 	mtv     $t0, S220
 	mtv     $t1, S221
-	vi2f.s  S220, S220, 0
-	vi2f.s  S221, S221, 0
 	vzero.s S222
 	li      $t0, 0x437f0000
 	mtv     $t0, S223
@@ -93,20 +114,18 @@ gfx_transform_vertices_vfpu:
 	mtv     $t0, S200
 	mtv     $t1, S201
 	mtv     $t2, S202
-	vi2f.s  S200, S200, 0
-	vi2f.s  S201, S201, 0
-	vi2f.s  S202, S202, 0
+	vi2f.t  C200, C200, 0
 	vone.s  S203
 
-	vdot.q  S300, C000, C200
-	vdot.q  S301, C010, C200
-	vdot.q  S302, C020, C200
-	vdot.q  S303, C030, C200
+	vdot.q  S300, R000, C200
+	vdot.q  S301, R001, C200
+	vdot.q  S302, R002, C200
+	vdot.q  S303, R003, C200
 
-	vdot.q  S310, C100, C300
-	vdot.q  S311, C110, C300
-	vdot.q  S312, C120, C300
-	vdot.q  S313, C130, C300
+	vdot.q  S310, R100, C300
+	vdot.q  S311, R101, C300
+	vdot.q  S312, R102, C300
+	vdot.q  S313, R103, C300
 
 	sv.q    C300, LOADED_VERTEX_MODEL_POS($a0)
 	sv.q    C310, LOADED_VERTEX_CLIP_POS($a0)
@@ -139,6 +158,24 @@ gfx_transform_vertices_vfpu:
 
 .Lstore_fog_alpha:
 	sb      $t0, LOADED_VERTEX_FOG_ALPHA($a0)
+
+	vzero.q C330
+	beq     $t6, $zero, .Lstore_normal
+	nop
+	/* Transform signed object normals with the same load-time limb matrix.
+	 * Translation is excluded. Lighting accumulation is left to the GE. */
+	lb      $t0, 12($a1)
+	lb      $t1, 13($a1)
+	lb      $t2, 14($a1)
+	mtv     $t0, S320
+	mtv     $t1, S321
+	mtv     $t2, S322
+	vi2f.t C320, C320, 0
+	vdot.t S330, R000, C320
+	vdot.t S331, R001, C320
+	vdot.t S332, R002, C320
+.Lstore_normal:
+	sv.q    C330, 48($a0)
 
 	addiu   $a1, $a1, VTX_SIZE
 	addiu   $a0, $a0, LOADED_VERTEX_SIZE

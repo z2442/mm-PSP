@@ -47,6 +47,7 @@ static void swizzle_fast(unsigned char* dst, const unsigned char* src, unsigned 
 static unsigned int mode, texWidth, texHeight, modeCalls, flushes;
 static const void* texAddress;
 static void sceKernelDcacheWritebackRange(void* p, unsigned int size) {}
+static void sceKernelDcacheWritebackInvalidateRange(void* p, unsigned int size) {}
 static void sceGuTexFlush(void) {flushes++;}
 static void sceGuClutMode(int a,int b,int c,int d) {}
 static void sceGuClutLoad(int a,const void* p) {}

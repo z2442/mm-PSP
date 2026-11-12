@@ -7,6 +7,9 @@
 #include "sched.h"
 
 void OotPspRenderer_Init(void);
+bool OotPspRenderer_PrepareSuspend(void);
+bool OotPspRenderer_Resume(void);
+void OotPspRenderer_RenderSuspendMessage(const char* message, const char* hint);
 void OotPspRenderer_RenderDisplayList(Gfx* dl);
 void OotPspRenderer_RenderTask(const OSTask* task);
 bool OotPspRenderer_IsDepthClear(int32_t x, int32_t y);
@@ -19,7 +22,7 @@ void OotPspRenderer_SetHomeMenuBackgroundActive(bool active);
 int OotPspRenderer_ApplyVideoSettings(void);
 void OotPspRenderer_RenderHomeMenu(int selectedIndex, int screen, int submenuSelectedIndex,
                                    const char* statusMessage, uint8_t highlightRed, uint8_t highlightGreen,
-                                   uint8_t highlightBlue);
+                                   uint8_t highlightBlue, int batteryPercent);
 void OotPspRenderer_RenderFirstBootProgress(uint32_t progressPermille, const char* statusMessage, bool error);
 
 #endif

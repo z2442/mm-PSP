@@ -59,6 +59,7 @@ static const OotPspN64Action sN64Actions[] = {
 };
 
 static int sDeadzone;
+static int sN64StickScalingEnabled;
 static int sInitialized;
 
 static int OotPspControls_StrIcmp(const char* a, const char* b) {
@@ -178,6 +179,7 @@ void OotPspControls_InitDefaults(void) {
     }
 
     sDeadzone = 0;
+    sN64StickScalingEnabled = true;
     sInitialized = true;
 }
 
@@ -270,8 +272,15 @@ s32 OotPspControls_Load(void) {
             if (bindingIndex >= 0) {
                 sButtonBindings[bindingIndex].n64Mask = OotPspControls_ParseActionList(value);
             }
-        } else if ((section == 2) && (OotPspControls_StrIcmp(key, "deadzone") == 0)) {
-            OotPspControls_SetDeadzone(atoi(value));
+        } else if (section == 2) {
+            if (OotPspControls_StrIcmp(key, "deadzone") == 0) {
+                OotPspControls_SetDeadzone(atoi(value));
+            } else if (OotPspControls_StrIcmp(key, "n64_stick_scaling") == 0) {
+                OotPspControls_SetN64StickScalingEnabled((OotPspControls_StrIcmp(value, "off") != 0) &&
+                                                         (OotPspControls_StrIcmp(value, "false") != 0) &&
+                                                         (OotPspControls_StrIcmp(value, "no") != 0) &&
+                                                         (OotPspControls_StrIcmp(value, "0") != 0));
+            }
         }
     }
 
@@ -307,6 +316,7 @@ s32 OotPspControls_Save(void) {
 
     OOT_PSP_CONTROLS_APPEND("\n[analog]\n");
     OOT_PSP_CONTROLS_APPEND("deadzone = %d\n", sDeadzone);
+    OOT_PSP_CONTROLS_APPEND("n64_stick_scaling = %s\n", sN64StickScalingEnabled ? "on" : "off");
 
 #undef OOT_PSP_CONTROLS_APPEND
 
@@ -338,11 +348,22 @@ u16 OotPspControls_MapButtons(u32 pspButtons) {
 
 s8 OotPspControls_MapStick(u8 raw) {
     s32 centered = (s32)raw - 128;
+    s32 magnitude;
 
     OotPspControls_EnsureInitialized();
 
     if ((centered >= -sDeadzone) && (centered <= sDeadzone)) {
         centered = 0;
+    }
+
+    if (sN64StickScalingEnabled) {
+        /* Use the PSP stick's full travel for the N64's usable -80..80 range. */
+        magnitude = (centered < 0) ? -centered : centered;
+        if (magnitude > 127) {
+            magnitude = 127;
+        }
+        magnitude = ((magnitude * 80) + 63) / 127;
+        centered = (centered < 0) ? -magnitude : magnitude;
     }
 
     if (centered < -80) {
@@ -432,4 +453,13 @@ void OotPspControls_SetDeadzone(int deadzone) {
 
 void OotPspControls_AdjustDeadzone(int delta) {
     OotPspControls_SetDeadzone(sDeadzone + delta);
+}
+
+int OotPspControls_IsN64StickScalingEnabled(void) {
+    OotPspControls_EnsureInitialized();
+    return sN64StickScalingEnabled;
+}
+
+void OotPspControls_SetN64StickScalingEnabled(int enabled) {
+    sN64StickScalingEnabled = enabled != 0;
 }

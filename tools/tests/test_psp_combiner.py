@@ -18,9 +18,13 @@ def harness():
     source = (GFX / 'gfx_fast3d.c').read_text()
     gbi = (ROOT / 'include/PR/gbi.h').read_text()
     macros = '\n'.join(line for line in gbi.splitlines() if re.match(
-        r'#define (G_CCMUX_|G_ACMUX_|G_MDSFT_(CYCLETYPE|TEXTFILT)|G_CYC_|G_TF_|G_IM_(FMT|SIZ)_|G_TX_(WRAP|MIRROR|CLAMP|NOMASK))', line))
+        r'#define (G_CCMUX_|G_ACMUX_|G_MDSFT_(CYCLETYPE|TEXTFILT)|G_CYC_|G_TF_|G_IM_(FMT|SIZ)_|G_TX_(WRAP|MIRROR|CLAMP|NOMASK)|G_TEXTURE_IMAGE_FRAC)', line))
     fields = source[source.index('    uint32_t combine_mode;'):source.index('    struct XYWidthHeight viewport, scissor;', source.index('    uint32_t combine_mode;'))]
     decoder = source[source.index('static uint8_t color_comb_component('):source.index('static void gfx_dp_set_env_color(')]
+    dimensions = ''
+    for name in ('gfx_texture_tile_span', 'gfx_texture_tile_width', 'gfx_texture_tile_height'):
+        start = re.search(r'^static [^\n]*\b' + name + r'\([^;]*?\)\s*\{', source, re.M).start()
+        dimensions += source[start:source.index('\n}', start) + 2] + '\n'
     return r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -73,8 +77,9 @@ static struct {uint32_t(*new_texture)(void); void(*select_texture)(int,uint32_t)
 #define GU_PSM_8888 3
 #define SCALE_5_8(v) (((v)*255)/31)
 static TextureTileState* gfx_get_texture_tile(int i) {return &rdp.texture_tile[i];}
-static uint32_t gfx_texture_import_width(int i) {dimensionQueries++; return (rdp.texture_tile[i].lrs-rdp.texture_tile[i].uls+4)/4;}
-static uint32_t gfx_texture_import_height(int i) {dimensionQueries++; return (rdp.texture_tile[i].lrt-rdp.texture_tile[i].ult+4)/4;}
+''' + dimensions + r'''
+static uint32_t gfx_texture_import_width(int i) {dimensionQueries++; return gfx_texture_tile_width(i);}
+static uint32_t gfx_texture_import_height(int i) {dimensionQueries++; return gfx_texture_tile_height(i);}
 static bool gfx_is_power_of_two(uint32_t n) {return n && !(n&(n-1));}
 static uint32_t gfx_texture_source_span_size(int i) {return 8192;}
 static bool OotPsp_IsRuntimeByteRange(const void* p,uint32_t n) {return runtimeSource;}
@@ -262,6 +267,45 @@ runtimeSource=true; assert(prepare_material()); count=uploads;
 sTextureCacheFrameSerial++; assert(prepare_material()); assert(uploads==count+1);
 ''')
 
+    def test_clock_town_wrapped_material_layers(self):
+        self.compile_run('''
+setup();
+rdp.texture_tile[0].shifts=15;
+rdp.texture_tile[1].fmt=G_IM_FMT_RGBA; rdp.texture_tile[1].siz=G_IM_SIZ_16b;
+rdp.loaded_texture[1].row_stride_bytes=64;
+for (int y=0;y<32;y++) for (int x=0;x<32;x++) {
+ pixels[0][y*32+x]=x*5+y*3;
+ uint16_t color=(x<<11)|(y<<6)|(((x+y)&31)<<1)|1;
+ pixels[1][(y*32+x)*2]=color>>8; pixels[1][(y*32+x)*2+1]=color;
+}
+uint32_t allocation=0;
+for (int frame=0;frame<64;frame++) {
+ sTextureCacheFrameSerial++;
+ int origins[2][2]={{-37+frame*3,-77+frame*2},{109-frame*2,-14-frame}};
+ for (int slot=0;slot<2;slot++) {
+  TextureTileState* tile=&rdp.texture_tile[slot];
+  tile->uls=origins[slot][0]&4095; tile->ult=origins[slot][1]&4095;
+  tile->lrs=(tile->uls+124)&4095; tile->lrt=(tile->ult+124)&4095;
+ }
+ assert(prepare_material());
+ assert(sMaterialTexture->width==64 && sMaterialTexture->height==32);
+ if (!frame) allocation=sMaterialTexture->textureId;
+ assert(sMaterialTexture->textureId==allocation);
+ for (int y=0;y<32;y++) for (int x=0;x<64;x++) {
+  int x0=(int)floorf(x-origins[0][0]*0.25f)&31;
+  int y0=(int)floorf(y-origins[0][1]*0.25f)&31;
+  int x1=(int)floorf(x*0.5f-origins[1][0]*0.25f)&31;
+  int y1=(int)floorf(y-origins[1][1]*0.25f)&31;
+  int intensity=x0*5+y0*3;
+  struct RGBA expected={(intensity*SCALE_5_8(x1)+127)/255,
+                       (intensity*SCALE_5_8(y1)+127)/255,
+                       (intensity*SCALE_5_8((x1+y1)&31)+127)/255,127};
+  assert(memcmp(&uploaded[y*64+x],&expected,sizeof(expected))==0);
+ }
+}
+assert(nextId==1); // Crossing zero changes phase, not texture dimensions or allocation.
+''')
+
     def test_texture_formats_and_descending_alpha(self):
         self.compile_run('''
 setup();
@@ -295,6 +339,32 @@ uint32_t equation=2 | (1<<3) | (6<<6) | (1<<9);
 rdp.prim_lod_frac=255; assert(gfx_material_alpha(equation,255,0,0)==0);
 rdp.prim_lod_frac=0; assert(gfx_material_alpha(equation,255,0,0)==255);
 rdp.prim_lod_frac=128; assert(gfx_material_alpha(equation,255,0,0)==127);
+''')
+
+    def test_clock_town_mirrored_wall_requires_two_passes(self):
+        self.compile_run('''
+setup();
+/* Z2_TOWN_room_00DL_003678: the different T shifts require a 256-row
+ * common domain, beyond the 128-row material cache. Exercise the fallback
+ * deliberately instead of letting fused materials hide its UV stream. */
+for (int slot=0;slot<2;slot++) {
+ TextureTileState* tile=&rdp.texture_tile[slot];
+ tile->fmt=G_IM_FMT_RGBA; tile->siz=G_IM_SIZ_16b;
+ tile->cms=G_TX_MIRROR;
+ tile->cmt=slot ? G_TX_WRAP : G_TX_MIRROR;
+ tile->shifts=slot ? 0 : 15; tile->shiftt=slot ? 14 : 0;
+ rdp.loaded_texture[slot].row_stride_bytes=64;
+}
+rdp.texture_tile[0].uls=0xFDB; rdp.texture_tile[0].ult=0xFB3;
+rdp.texture_tile[0].lrs=0x057; rdp.texture_tile[0].lrt=0x02F;
+rdp.texture_tile[1].uls=0x06D; rdp.texture_tile[1].ult=0xFF2;
+rdp.texture_tile[1].lrs=0x0E9; rdp.texture_tile[1].lrt=0x06E;
+assert(rdp.combine_two_texture_blend && rdp.combine_two_texture_multiply);
+assert(!prepare_material() && uploads==0);
+/* Reducing that domain makes fusion possible, proving why it fell back. */
+rdp.texture_tile[1].shiftt=15;
+assert(prepare_material());
+assert(sMaterialTexture->width==128 && sMaterialTexture->height==128);
 ''')
 
 

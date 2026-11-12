@@ -25,5 +25,7 @@ void OotPspControls_CycleBinding(int index, int direction);
 int OotPspControls_GetDeadzone(void);
 void OotPspControls_SetDeadzone(int deadzone);
 void OotPspControls_AdjustDeadzone(int delta);
+int OotPspControls_IsN64StickScalingEnabled(void);
+void OotPspControls_SetN64StickScalingEnabled(int enabled);
 
 #endif

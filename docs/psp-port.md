@@ -1,150 +1,205 @@
 # Majora's Mask PSP port
 
-This target runs Majora's Mask's native game code on PSP. Its Allegrex/libultra
-layer, F3DEX2 renderer, audio mixer, controller mapping, video output, and home
-menu were derived from the OoT PSP port and are vendored under
-`src/port/psp/backend`. MM-specific overlays, message data, archives, flash
-saves, and its 32 kHz audio tables are built from this tree. No OoT checkout is
-required.
+The PSP port runs MM's native game code with a vendored Allegrex/libultra,
+F3DEX2/GU renderer, audio mixer, controls, video output, and HOME menu from
+[z2442/oot-PSP](https://github.com/z2442/oot-PSP). The shared backend was updated
+through `d4ad96c045d39e18a80f7a1f5d7f8fdba9621d38` (November 10, 2026).
+No sibling OoT checkout is needed.
 
-MM needs the N64 Expansion Pak memory layout. The PSP target therefore allocates
-an 8 MiB system/game arena (`MM_PSP_SYSTEM_HEAP_SIZE`), exactly twice the OoT
-port's 4 MiB arena. It is allocated from the user partition at runtime instead
-of being embedded in the PRX's static image, which keeps raw PSPLink module
-loads below the default-partition limit. The EBOOT requests expanded memory with
-`MEMSIZE=1`, so it is intended for PSP-2000/3000/Go hardware or an emulator with
-the Slim memory model. A PSP-1000 does not provide that memory configuration.
+MM requires PSP-2000/3000/Go expanded memory, or PPSSPP with a Slim memory
+model. The EBOOT requests `MEMSIZE=1`. Its game arena remains 8 MiB, allocated
+at runtime separately from the 1 MiB newlib font/bootstrap heap. PSP-1000 is
+unsupported. Renderer storage and temporary conversion/cache allocations use
+separate user-partition blocks.
 
-## Material rendering validation
+## Build and install
 
-The PSP combiner folds primitive tint and vertex lighting across both RDP
-cycles. For supported periodic two-texture materials it combines RGB and both
-alpha equations into a cached texture before framebuffer blending. This covers
-Clock Town's detail-texture products and crossfades, including independently
-scaled and scrolling water tiles. Water's additive primitive color is drawn
-before fog. Single-cycle materials use the second mux bank.
-
-Material rebuilds decode each source once and precompute sampling coordinates.
-Scrolling variants reuse allocations after the previous frame has completed;
-variants already queued in the current frame keep separate allocations. Texture
-uploads explicitly refresh the GU format, dimensions, and texture cache, including
-when an ID was selected before its first upload.
-
-The material cache supports RGBA16, I4, I8, and IA8 with a common repeating or
-mirrored domain up to 128 by 128 texels. Clamped tiles, larger domains, other
-formats, and equations requiring per-vertex shade alpha retain the existing
-renderer fallback. This is not a complete, bit-exact RDP implementation:
-filtering a precombined texture, 8-bit arithmetic, the additive pass's saturation,
-and the existing approximation of texture LOD can still differ from N64 output.
-
-Run the host regression checks with:
+Install PSPSDK, intraFont, and the VME-capable Media Engine library pinned in
+[the workflow](../.github/workflows/psp-build.yml). Host tools include GNU Make,
+Python 3 with PyYAML, and MIPS binutils. A normal PSP build requires no ROM,
+extraction tree, or `make setup`:
 
 ```sh
-python3 -m unittest discover -s tools/tests -p 'test_psp_*.py'
+python3 -m venv .venv
+.venv/bin/python3 -m pip install 'PyYAML>=6.0.1,<7.0.0'
+./psp.sh VERSION=n64-us
+python3 tools/package_psp.py build/psp-port/n64-us build/mm-psp-n64-us.zip
 ```
 
-These compile the actual combiner decoder and material sampler with a mock
-texture backend. They check pixel values, alpha endpoints, texture formats,
-scrolling, mirroring, cache invalidation, and cycle selection. A 120-frame test
-checks allocation reuse for three animated materials. A separate texture-manager
-test checks GU binding commands for initial uploads and allocation reuse, with
-PSP memory checks and VFPU copies mocked for the host. Extracted South
-and East Clock Town display-list equations are also checked when available.
-They do not execute the PSP GU. Hardware validation should inspect both towns'
-floors and water while moving the camera, changing areas, and crossing dusk or
-dawn; also check HUD sun/moon visibility and the Termina Field to swamp route.
-Check frame rate during water scrolling, which still requires CPU pixel updates.
+Use `JOBS=8 ./psp.sh` to limit parallelism. `MAKE=gmake` is supported, and macOS
+selects `gmake` by default. Builds are incremental; configuration changes
+invalidate compiled objects. `make psp-port-clean` removes the selected PSP
+build directory.
 
-## Build
+Keep PSP build output in `build/psp-port/n64-us`; the installer ZIP is
+`build/mm-psp-n64-us.zip`. Use a temporary directory outside the checkout for
+private reference builds.
 
-The build requires:
+Extract the ZIP and copy `MM_PSP` into `PSP/GAME` on either storage device:
 
-- a working PSPSDK (`psp-config`, `psp-gcc`, `psp-prxgen`, and `pack-pbp` on
-  `PATH`);
-- the PSP intraFont library and headers (`libintrafont`);
-- the matching US Majora's Mask baserom required by this decompilation project.
+- PSP Go internal storage: `ef0:/PSP/GAME/MM_PSP/`
+- Memory Stick or PSP Go M2 card: `ms0:/PSP/GAME/MM_PSP/`
 
-The custom HOME menu loads `flash0:/font/ltn0.pgf` through intraFont during
-renderer initialization. The font comes from PSP firmware; no font file needs
-to be copied to the game folder. The bitmap fallback is retained for runtime
-initialization or font-load failures.
-
-Prepare the decompilation assets once, then build the PSP package:
-
-```sh
-make setup
-make -j"$(nproc)" assets
-./psp.sh
-```
-
-The default `n64-us` build produces:
+The same package works on both. Add your own **compressed,
+big-endian US Majora's Mask ROM**, 32 MiB, CRC32 **B428D8A7**, as
+`MM_PSP/data/basrom.z64` (`baserom.z64` also works). The installed layout is:
 
 ```text
-build/psp-port/n64-us/
+PSP/GAME/MM_PSP/
 ├── EBOOT.PBP
-├── mm-psp-port.prx
 ├── Plugins/dvemgr.prx
-└── data/segments/oot_psp_assets.bin
+├── README.txt
+└── data/basrom.z64          # supplied by the user
 ```
 
-The external asset filename is retained for compatibility with the derived
-loader; its contents are generated entirely from MM assets.
+The first launch validates the ROM, displays conversion progress, and creates
+`data/segments/oot_psp_assets.bin` through a temporary file. The retained filename
+is a backend compatibility detail; every asset comes from MM. Later launches
+reuse the pack. Delete it to rebuild. The executable's zero placeholders are
+filled from the pack each launch. Message arrays preserve offsets and lengths;
+message text is read directly from the pack. The package contains no ROM or converted
+assets. Flash saves are stored as `mm-psp-save.bin` beside the EBOOT.
+Completed writes are reported to MM's save state machine so name entry and
+options return after their normal two-second confirmation delay. Game deadlines
+use the N64 counter's time units.
 
-To use a specific job count:
+The launch directory determines the storage for the ROM, asset pack, saves,
+`controls.ini`, `video.ini`, plugins, and sleep recovery data. A Go internal
+installation reads `ef0:/PSP/GAME/MM_PSP/data/basrom.z64`, for example. Startup
+resolves bare or relative executable names against the launch working directory;
+later working-directory changes do not move storage to another device. Separate
+installations keep separate saves and settings. Copy the entire `MM_PSP` folder
+when moving between internal storage and a card.
 
-```sh
-JOBS=8 ./psp.sh
-```
+## Rendering and presentation
 
-Use `make psp-port-clean` to remove only the PSP target's generated files.
+The backend includes GPU ambient/diffuse lighting, immutable native mesh
+caching, batched GE submissions, improved texture stride/mirroring and cache
+reuse, decal depth fixes, zero-opacity fog suppression, and effect material
+fixes. MM's two-cycle material cache, animated water, per-tile palettes, HUD
+projection, and native motion blur are retained. Player silhouette shadows use
+the GU stamp path; MM's fractional shadow rows are quantized to pixel rows.
 
-The audio-command mixer uses the PSP Media Engine by default and falls back to
-the Allegrex CPU if ME startup or a submitted job fails. MM synthesizes at
-32 kHz; the final output uses the backend's software resampler and a normal PSP
-audio channel instead of the hardware SRC channel. Either stage can be
-overridden for diagnosis:
+HOME > Video Settings offers 20 FPS (default) and 60 FPS presentation, VSync,
+LCD/TV output, and aspect ratio. Save `video.ini` to persist settings. Game logic
+keeps MM's original update interval; 60 FPS replays immutable display lists with
+matrix interpolation. Frame history resets on state/scene/room/camera changes,
+HOME, video mode changes, and sleep. Presentation waits run on a video thread.
+The shortened foreground camera plane preserves the original fog curve and
+first-person model-selection threshold.
+Normal cutscenes retain MM's original near plane for depth precision. Texture
+sampler modes are restored when returning from fused materials to cached tree
+layers and shadows. Motion blur restarts each GU list on the active draw buffer,
+uses unlit sprites, and refreshes its history texture before sampling it.
+Clock Town's wrapped tile bounds use 12-bit extents consistently for imports,
+mirroring, and both layers' UVs. Scrolling across zero keeps the same texture
+dimensions and allocation.
+Texture imports invalidate the remembered draw binding because uploads and
+GPU shadow generation can select another image internally. The base texture is
+rebound after both layers are prepared. Creating a shader submits the previous
+material's buffered geometry before changing the live GPU state.
+
+LCD uses triple buffering; TV modes use double buffering to fit VRAM. DVE output
+requires supported hardware, a cable, and `Plugins/dvemgr.prx`. The firmware font
+`flash0:/font/ltn0.pgf` supplies HOME text through intraFont, with a bitmap fallback.
+
+## Audio and sleep
+
+MM synthesizes at 32 kHz. The Media Engine mixes audio commands by default,
+while MM's command-list construction remains on Allegrex. Output uses software
+resampling and a normal PSP audio channel. Diagnostic overrides include:
 
 ```sh
 PSP_AUDIO_MEDIA_ENGINE=0 ./psp.sh
 PSP_AUDIO_HARDWARE_SRC=1 ./psp.sh
+PSP_AUDIO_DIAGNOSTICS=1 PSP_WAKE_DIAGNOSTICS=1 ./psp.sh
 ```
 
-The main thread uses a 256 KiB stack rather than OoT's 1 MiB stack. MM's larger
-module image plus a 1 MiB stack can exhaust PSPLink's default user partition
-before `main()` is entered, even on hardware where an XMB launch honors the
-EBOOT's expanded-memory request.
+The power callback requests coordinated sleep. The game thread drains graphics
+and audio, snapshots/releases volatile asset memory, and waits for firmware
+resume completion before restoring assets, graphics, clocks, frame pacing, and
+the ME worker. Failed restoration stays on a retry/quit screen. MM's 32 kHz
+pitch range does not need OoT's 22.05 kHz four-part high-pitch synthesis path.
 
-The newlib bootstrap heap is fixed at 64 KiB. Game allocations do not use that
-heap: they are served by MM's dedicated 8 MiB `gMmPspSystemHeap`. This avoids
-newlib's negative “all remaining memory” policy during raw PRX launches.
+## CI and validation
 
-The renderer's permanent pause/home-menu framebuffer captures and optional TV
-texture cache use separate user-partition blocks. They therefore do not depend
-on the 64 KiB newlib heap and do not reduce the 8 MiB game arena. The misleading
-`OUT OF FRAMEBUFFER MEMORY!` path in the shared renderer is a system-RAM
-allocation, not a failure to fit the LCD buffers in EDRAM.
+The PSP workflow runs on pushes, pull requests, and manual requests. It verifies
+pinned toolchain and ME-library downloads, builds, runs host regressions, and
+uploads `mm-psp-build` containing `mm-psp-n64-us.zip` for 30 days. Successful
+push/manual builds of the default branch update the rolling `latest`
+prerelease. An older rerun cannot replace a newer branch-head release.
 
-Pinned and sliding external-asset caches also use reversible user-partition
-blocks. This lets MM pin its roughly 5.3 MiB Audiotable instead of failing over
-to the PSP's 4 MiB volatile partition, while the game arena remains exactly
-8 MiB.
+Run host regressions after building:
 
-MM's original libc64 allocator exports `malloc`, `free`, `calloc`, and
-`realloc`. For PSP these are source-mapped to private `MmPspGame_*` symbols.
-This keeps them separate from newlib's allocator, which must be operational
-before `main()` while newlib creates its recursive lock work areas.
-
-## Install
-
-Copy the package while preserving the `data/segments` subdirectory:
-
-```text
-ms0:/PSP/GAME/MMPSP/
-├── EBOOT.PBP
-├── Plugins/dvemgr.prx
-└── data/segments/oot_psp_assets.bin
+```sh
+python3 tools/run_psp_tests.py
 ```
 
-The port creates `mm-psp-save.bin` beside the EBOOT for MM's 1-Mbit flash save.
-The generated asset pack is build output and does not contain or require a ROM
-on the PSP.
+The tests exercise actual renderer/texture/transform code, VFPU instruction
+models, frame interpolation and pacing, video workers, sleep recovery,
+`ef0:`/`ms0:` storage routing, MM ROM header/checksum validation, and the complete
+asset builder with raw, Yaz0, and MM's zero-filled symbol-only segments. Synthetic
+ROM fixtures also check temporary-file cleanup after failed extraction. The tests
+also cover file-select save completion, two-second deadlines, owl backup writes,
+blur across rotating framebuffers, and sampler restoration after material/effect
+changes. Clock Town wall tests sweep both tiles across the complete coordinate
+wrap and compare scrolling combined-material pixels. Material-transition tests
+also cover secondary uploads, cache hits, mutable images, GPU shadow imports,
+and cached draw bindings after uploads. Shader lifecycle tests run the real
+frontend lookup and GU cache construction, checking that first-use and cached
+lookups leave pending geometry and active GPU state identical. Only the final
+pipeline switch flushes and selects a shader. Layer tests run clipped triangles
+through emission and both draw passes, checking independent UVs and identical
+positions/depth bias, including multiply materials too large for the combined
+texture cache. VFPU instruction checks also verify interpolated positions and
+UVs across all six planes. They do not emulate PSP rasterization.
+MM's letterbox regression also runs its native bar-drawing function through the
+renderer, checking every row against the scaled scene scissor for all bar sizes
+from 0 to 32 on LCD and TV. Both use the same endpoint rounding so Z-targeting
+cannot leave clear-color gaps along the black bars.
+On hardware,
+check Clock Town floors and scrolling water, HUD and pause, aiming, animated
+limbs and lighting, state transitions, TV changes, and repeated sleep/wake with
+sound. Measure performance on hardware before claiming an FPS improvement.
+
+## Refreshing build interfaces and conversion recipes
+
+The repository contains C interfaces, symbol addresses, array sizes and
+source-offset conversion recipes. Compilation emits **zero storage only** for
+assets. There is no pre-extracted asset archive or archive restore step.
+Every live asset is reconstructed from the PSP-created pack before game code
+runs. The build regenerates schedule code from the checked-in schedule scripts.
+
+Maintainers can refresh the interface descriptions and recipes from a private
+reference build:
+
+```sh
+make setup
+make -j8 assets
+./psp.sh MM_PSP_ROM_INDEPENDENT=0 PSP_BUILD_DIR=/tmp/mm-psp-reference/n64-us
+python3 tools/psp_port_build_interfaces.py create \
+    /tmp/mm-psp-reference/n64-us extracted/n64-us/baserom assets/psp/n64-us
+python3 tools/psp_port_runtime_patches.py create n64-us \
+    /tmp/mm-psp-reference/n64-us/mm-psp-port.base.elf \
+    /tmp/mm-psp-reference/n64-us/oot_psp_asset_segments.c \
+    extracted/n64-us/baserom assets/psp/n64-us/runtime_patches.z
+```
+
+`build_interfaces.json` describes declarations and storage sizes. It contains no
+asset initializers; source includes contain only zeros. Runtime pointer targets
+are resolved by symbol name so no pointer-bearing asset initializer is needed
+at compile time. The linker retains this zero storage for first-boot loading.
+Never commit ROMs, extraction trees, reference ELFs, or the converted asset
+pack. ROM-independent interfaces currently support `n64-us`.
+
+After a fresh ROM-independent build, validate the metadata against the private
+reference (the optional ROM argument also checks the actual C Yaz0 decoder):
+
+```sh
+python3 tools/validate_psp_metadata.py \
+    /tmp/mm-psp-reference/n64-us build/psp-port/n64-us extracted/n64-us/baserom \
+    --rom baseroms/n64-us/baserom.z64
+```
+
+This checks packed bytes, runtime conversion recipes, every changed live
+initialized object, and linked message sizes and ordering.

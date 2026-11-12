@@ -1,3 +1,6 @@
+#if PLATFORM_PSP
+#include "oot_psp_frame_interpolation.h"
+#endif
 #include "z64effect_ss.h"
 
 #include "tha.h"
@@ -76,6 +79,9 @@ void EffectSs_Delete(EffectSs* effectSs) {
 void EffectSs_Reset(EffectSs* effectSs) {
     u32 i;
 
+#if PLATFORM_PSP
+    OotPspFrameInterpolation_ForgetIdentity(effectSs);
+#endif
     effectSs->type = EFFECT_SS_TYPE_MAX;
     effectSs->accel.x = effectSs->accel.y = effectSs->accel.z = 0;
     effectSs->velocity.x = effectSs->velocity.y = effectSs->velocity.z = 0;
@@ -253,7 +259,13 @@ void EffectSs_Draw(PlayState* play, s32 index) {
     EffectSs* effectSs = &sEffectSsInfo.table[index];
 
     if (effectSs->draw != NULL) {
+#if PLATFORM_PSP
+        OotPspFrameInterpolation_SetIdentity(effectSs);
+#endif
         effectSs->draw(play, index, effectSs);
+#if PLATFORM_PSP
+        OotPspFrameInterpolation_SetIdentity(NULL);
+#endif
     }
 }
 

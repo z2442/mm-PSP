@@ -303,6 +303,10 @@ Acmd* AudioSynth_BuildCommandListMe(Acmd* abiCmdStart, s32* numAbiCmds, s16* aiB
     return AudioSynth_BuildCommandList(abiCmdStart, numAbiCmds, aiBufStart, numSamplesPerFrame);
 }
 
+void OotPspAudioSynth_InitMe(void) {
+    /* MM builds command lists on Allegrex; no ME-local synthesis state. */
+}
+
 s32 AudioSynth_CanBuildCommandsOnMe(void) {
     /* MM starts on Allegrex; ME command construction can be enabled after the
      * MM-specific synthesis state cache ranges have been audited. */

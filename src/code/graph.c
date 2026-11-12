@@ -29,6 +29,8 @@ OSTime sGraphPrevUpdateEndTime;
 #include "z_title_setup.h"
 #if defined(TARGET_PSP) || defined(PLATFORM_PSP)
 #include "oot_psp_audio_backend.h"
+#include "oot_psp_frame_interpolation.h"
+#include "oot_psp_video.h"
 #endif
 
 void Graph_FaultClient(void) {
@@ -256,7 +258,20 @@ void Graph_ExecuteAndDraw(GraphicsContext* gfxCtx, GameState* gameState) {
     gameState->unk_A3 = 0;
     Graph_SetNextGfxPool(gfxCtx);
 
+#if PLATFORM_PSP
+    {
+        PlayState* play = gameState->main == Play_Main ? (PlayState*)gameState : NULL;
+        OotPspFrameInterpolation_Begin(gameState, play ? play->sceneId : -1,
+                                      play ? play->roomCtx.curRoom.num : -1,
+                                      play ? play->activeCamId : -1,
+                                      play != NULL && play->pauseCtx.state == 0 &&
+                                          OotPspVideo_GetFrameRate() == 60);
+    }
+#endif
     GameState_Update(gameState);
+#if PLATFORM_PSP
+    OotPspFrameInterpolation_End();
+#endif
 
     OPEN_DISPS(gfxCtx);
 

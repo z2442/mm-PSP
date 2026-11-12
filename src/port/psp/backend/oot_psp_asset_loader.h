@@ -12,6 +12,8 @@
 #define OOT_PSP_ASSET_READ_NOT_EXTERNAL 1
 #define OOT_PSP_EXTERNAL_ASSET_NATIVE 1
 #define OOT_PSP_EXTERNAL_ASSET_TEXTURE_WORDS 2
+/* Audited static mesh assets only; in-place writers must never use this flag. */
+#define OOT_PSP_EXTERNAL_ASSET_IMMUTABLE_MESH 4
 
 typedef struct OotPspExternalAsset {
     uintptr_t vromStart;
@@ -52,9 +54,10 @@ extern const OotPspMessageEntry gOotPspStaffMessageEntries[];
 extern const size_t gOotPspStaffMessageEntriesCount;
 
 s32 OotPsp_AssetInit(const char* executablePath);
-/* Callback-safe notification. The next asset transaction reopens the packed
- * file without discarding any allocated cache storage. */
-void OotPsp_AssetNotifyResume(void);
+/* Main thread only, with audio/video parked. Resume also rolls back a failed
+ * prepare; readers stay locked out until it returns true. */
+s32 OotPsp_AssetPrepareSuspend(void);
+s32 OotPsp_AssetResume(void);
 const char* OotPsp_ResolveRootPath(const char* path, char* buffer, size_t bufferSize);
 uintptr_t OotPsp_NormalizeVrom(uintptr_t vrom);
 void OotPsp_NormalizeRomFile(RomFile* file);
@@ -69,6 +72,7 @@ s32 OotPsp_MarkLoadedExternalAssetRangeFlags(const void* ptr, size_t size, u32 f
  * transformed. This replaces stale source metadata and gives texture caches a
  * new serial while retaining raw N64 byte order (flags == 0). */
 void OotPsp_RegisterRuntimeAssetWrite(void* ptr, size_t size);
+u32 OotPsp_GetExternalAssetGeneration(void);
 u32 OotPsp_GetExternalAssetRangeSerial(const void* ptr, size_t size);
 s32 OotPsp_GetNativeExternalTextureMappingRange(const void* ptr, uintptr_t* ramStart, uintptr_t* ramEnd);
 s32 OotPsp_GetNativeExternalTextureRangeStart(const void* ptr, size_t size, uintptr_t* ramStart);

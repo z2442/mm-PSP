@@ -3,12 +3,17 @@
 #include "buffers.h"
 #include "fault.h"
 #include "libc64/malloc.h"
+#include "mm_psp_path.h"
 #include "oot_psp_asset_loader.h"
 #include "oot_psp_audio_backend.h"
 #include "oot_psp_controls.h"
 #include "oot_psp_dve.h"
 #include "oot_psp_home_menu.h"
 #include "oot_psp_renderer.h"
+#include "oot_psp_suspend.h"
+#include "oot_psp_runtime_patch.h"
+#include "oot_psp_video_thread.h"
+#include "oot_psp_frame_interpolation.h"
 #include "oot_psp_video.h"
 #include "sys_cfb.h"
 #include "z64DLF.h"
@@ -43,32 +48,43 @@ static int MmPspExitCallback(UNUSED int arg1, UNUSED int arg2, UNUSED void* comm
 }
 
 static int MmPspPowerCallback(UNUSED int arg1, int powerInfo, UNUSED void* common) {
-    if (powerInfo & PSP_POWER_CB_RESUMING) {
-        OotPsp_AssetNotifyResume();
-    }
+    OotPspSuspend_NotifyPowerEvent(powerInfo);
+
     return 0;
 }
+
+static volatile s32 sMmPspPowerCallbackReady;
 
 static int MmPspCallbackThread(UNUSED SceSize args, UNUSED void* argp) {
     int exitCallbackId = sceKernelCreateCallback("MM PSP Exit Callback", MmPspExitCallback, NULL);
     int powerCallbackId = sceKernelCreateCallback("MM PSP Power Callback", MmPspPowerCallback, NULL);
+    s32 callbackRegistered = false;
 
     if (exitCallbackId >= 0) {
         sceKernelRegisterExitCallback(exitCallbackId);
+        callbackRegistered = true;
     }
-    if (powerCallbackId >= 0) {
-        scePowerRegisterCallback(0, powerCallbackId);
+    if ((powerCallbackId >= 0) && (scePowerRegisterCallback(0, powerCallbackId) >= 0)) {
+        sMmPspPowerCallbackReady = true;
+        callbackRegistered = true;
     }
-    sceKernelSleepThreadCB();
+    if (callbackRegistered) {
+        sceKernelSleepThreadCB();
+    }
+
     return 0;
 }
 
-static void MmPspSetupCallbacks(void) {
+static s32 MmPspSetupCallbacks(void) {
     int threadId = sceKernelCreateThread("MM PSP Callback Thread", MmPspCallbackThread, 0x11, 0x1000, 0, NULL);
 
     if (threadId >= 0) {
-        sceKernelStartThread(threadId, 0, NULL);
+        if (sceKernelStartThread(threadId, 0, NULL) < 0) {
+            sceKernelDeleteThread(threadId);
+        }
     }
+    /* The higher-priority callback thread registers before StartThread returns. */
+    return sMmPspPowerCallbackReady;
 }
 
 static s32 MmPsp_InitGraphBuffers(void) {
@@ -117,6 +133,7 @@ static void MmPsp_RunGame(void) {
         GameState_Init(gameState, overlay->init, &gfxCtx);
 
         while (GameState_IsRunning(gameState)) {
+            OotPspSuspend_Poll();
             OotPspHomeMenu_PollHomeButton();
             if (OotPspHomeMenu_IsOpen()) {
                 if (OotPspHomeMenu_RunFrame(NULL) == OOT_PSP_HOME_MENU_RESULT_EXIT_GAME) {
@@ -131,6 +148,8 @@ static void MmPsp_RunGame(void) {
         if (nextOverlay != NULL) {
             nextOverlay = Graph_GetNextGameState(gameState);
         }
+        OotPspVideoThread_Wait();
+        OotPspFrameInterpolation_Reset();
         GameState_Destroy(gameState);
         free(gameState);
         Overlay_FreeGameState(overlay);
@@ -139,9 +158,14 @@ static void MmPsp_RunGame(void) {
 }
 
 int main(int argc, char** argv) {
-    const char* executablePath = ((argc > 0) && (argv != NULL)) ? argv[0] : NULL;
+    const char* argv0 = ((argc > 0) && (argv != NULL)) ? argv[0] : NULL;
+    char executablePath[256];
     s32 audioMeBootResult = 0;
 
+    if (!OotPspSuspend_Init()) {
+        sceKernelExitGame();
+        return 1;
+    }
     scePowerSetClockFrequency(333, 333, 166);
     pspFpuSetEnable(0);
 #if OOT_PSP_AUDIO_MEDIA_ENGINE
@@ -156,6 +180,12 @@ int main(int argc, char** argv) {
 #endif
            (long)audioMeBootResult
     );
+    if (!MmPsp_BuildExecutablePath(argv0, executablePath, sizeof(executablePath))) {
+        pspDebugScreenPrintf("MM PSP could not resolve the launch directory\n");
+        sceKernelDelayThread(3000000);
+        sceKernelExitGame();
+        return 1;
+    }
     if (!MmPspGame_ReserveHeap()) {
         pspDebugScreenPrintf("MM PSP could not allocate the 8 MiB game arena\n");
         sceKernelDelayThread(3000000);
@@ -167,7 +197,12 @@ int main(int argc, char** argv) {
     (void)OotPspDve_Init(executablePath);
     OotPspVideo_Init(executablePath);
     OotPspHomeMenu_Init();
-    MmPspSetupCallbacks();
+    if (!MmPspSetupCallbacks()) {
+        printf("mm-psp power callback registration failed\n");
+        OotPspDve_Shutdown();
+        sceKernelExitGame();
+        return 1;
+    }
 
     osInitialize();
     OotPspRenderer_Init();
@@ -178,6 +213,14 @@ int main(int argc, char** argv) {
         sceKernelExitGame();
         return 1;
     }
+#if MM_PSP_ROM_INDEPENDENT
+    if (!OotPspRuntimePatch_Apply()) {
+        pspDebugScreenPrintf("MM PSP runtime asset patching failed\n");
+        OotPspDve_Shutdown();
+        sceKernelExitGame();
+        return 1;
+    }
+#endif
     printf("mm-psp startup: assets ready\n");
 
     OotPspControls_Load();

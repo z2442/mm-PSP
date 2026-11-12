@@ -1,4 +1,5 @@
 #include "oot_psp_renderer.h"
+#include "scheduler.h"
 
 #include <stdbool.h>
 
@@ -7,6 +8,9 @@
 #include "gfx/gfx_window_psp.h"
 #include "oot_psp_performance.h"
 #include "oot_psp_video.h"
+#include "oot_psp_frame_interpolation.h"
+#include "oot_psp_video_thread.h"
+#include <pspgu.h>
 
 extern struct GfxRenderingAPI gfx_scegu_api;
 extern void gfx_scegu_request_pause_background(void);
@@ -16,12 +20,48 @@ extern void gfx_scegu_set_home_menu_background_active(bool active);
 extern int gfx_scegu_apply_video_mode(void);
 extern void gfx_scegu_render_home_menu(int selectedIndex, int screen, int submenuSelectedIndex,
                                        const char* statusMessage, uint8_t highlightRed, uint8_t highlightGreen,
-                                       uint8_t highlightBlue);
+                                       uint8_t highlightBlue, int batteryPercent);
 extern void gfx_scegu_render_first_boot_progress(uint32_t progressPermille, const char* statusMessage, bool error);
 extern bool gfx_scegu_depth_is_clear(int32_t x, int32_t y);
 extern bool gfx_scegu_depth_test(int32_t x, int32_t y, float projectedZ);
+extern void gfx_scegu_render_suspend_message(const char* message, const char* hint);
+extern int gfx_scegu_save_suspend_context(void);
+extern int gfx_scegu_restore_suspend_context(void);
 
 static bool sInitialized;
+
+static void OotPspRenderer_DrawSuspendMessage(void* arg) {
+    const char* const* lines = arg;
+
+    gfx_scegu_render_suspend_message(lines[0], lines[1]);
+}
+
+void OotPspRenderer_RenderSuspendMessage(const char* message, const char* hint) {
+    const char* lines[] = { message, hint };
+
+    gfx_render_callback_frame(OotPspRenderer_DrawSuspendMessage, lines);
+    /* The callback arguments live on this stack. */
+    OotPspVideoThread_Wait();
+}
+
+bool OotPspRenderer_PrepareSuspend(void) {
+    OotPspVideoThread_Wait();
+    sceGuSync(GU_SYNC_FINISH, GU_SYNC_WHAT_DONE);
+    OotPspFrameInterpolation_Reset();
+    return gfx_scegu_save_suspend_context() >= 0;
+}
+
+bool OotPspRenderer_Resume(void) {
+    if (gfx_scegu_restore_suspend_context() < 0) {
+        return false;
+    }
+    /* The OS preserved VRAM while the app released volatile memory. Rebind
+     * state on the next frame without discarding the warm texture cache. */
+    gfx_invalidate_render_state();
+    OotPspFrameInterpolation_Reset();
+    SchedPsp_ResetGfxPacing();
+    return true;
+}
 
 typedef struct OotPspHomeMenuRenderArgs {
     int selectedIndex;
@@ -31,6 +71,7 @@ typedef struct OotPspHomeMenuRenderArgs {
     uint8_t highlightRed;
     uint8_t highlightGreen;
     uint8_t highlightBlue;
+    int batteryPercent;
 } OotPspHomeMenuRenderArgs;
 
 typedef struct OotPspFirstBootProgressRenderArgs {
@@ -43,7 +84,7 @@ static void OotPspRenderer_DrawHomeMenu(void* arg) {
     const OotPspHomeMenuRenderArgs* menu = (const OotPspHomeMenuRenderArgs*)arg;
 
     gfx_scegu_render_home_menu(menu->selectedIndex, menu->screen, menu->submenuSelectedIndex, menu->statusMessage,
-                               menu->highlightRed, menu->highlightGreen, menu->highlightBlue);
+                               menu->highlightRed, menu->highlightGreen, menu->highlightBlue, menu->batteryPercent);
 }
 
 static void OotPspRenderer_DrawFirstBootProgress(void* arg) {
@@ -134,6 +175,7 @@ int OotPspRenderer_ApplyVideoSettings(void) {
     int result;
 
     OotPspRenderer_Init();
+    OotPspFrameInterpolation_Reset();
     result = gfx_scegu_apply_video_mode();
     /* The DVE transition reinitializes the GU and can invalidate texture data
      * already resident in the upper half of Slim EDRAM. Rebuild the cache on
@@ -145,10 +187,11 @@ int OotPspRenderer_ApplyVideoSettings(void) {
 
 void OotPspRenderer_RenderHomeMenu(int selectedIndex, int screen, int submenuSelectedIndex,
                                    const char* statusMessage, uint8_t highlightRed, uint8_t highlightGreen,
-                                   uint8_t highlightBlue) {
+                                   uint8_t highlightBlue, int batteryPercent) {
     OotPspHomeMenuRenderArgs args;
 
     OotPspRenderer_Init();
+    OotPspFrameInterpolation_Reset();
     args.selectedIndex = selectedIndex;
     args.screen = screen;
     args.submenuSelectedIndex = submenuSelectedIndex;
@@ -156,6 +199,7 @@ void OotPspRenderer_RenderHomeMenu(int selectedIndex, int screen, int submenuSel
     args.highlightRed = highlightRed;
     args.highlightGreen = highlightGreen;
     args.highlightBlue = highlightBlue;
+    args.batteryPercent = batteryPercent;
 
     gfx_render_callback_frame(OotPspRenderer_DrawHomeMenu, &args);
 }

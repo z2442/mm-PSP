@@ -3,6 +3,7 @@
 #include <pspctrl.h>
 #include <pspimpose_driver.h>
 #include <pspkernel.h>
+#include <psppower.h>
 #include <stddef.h>
 #include <stdio.h>
 
@@ -28,11 +29,13 @@
 #define OOT_PSP_VIDEO_MENU_ROW_OUTPUT 0
 #define OOT_PSP_VIDEO_MENU_ROW_RESOLUTION 1
 #define OOT_PSP_VIDEO_MENU_ROW_ASPECT 2
-#define OOT_PSP_VIDEO_MENU_ROW_APPLY 3
-#define OOT_PSP_VIDEO_MENU_ROW_SAVE 4
-#define OOT_PSP_VIDEO_MENU_ROW_RESET 5
-#define OOT_PSP_VIDEO_MENU_ROW_BACK 6
-#define OOT_PSP_VIDEO_MENU_ROW_COUNT 7
+#define OOT_PSP_VIDEO_MENU_ROW_VSYNC 3
+#define OOT_PSP_VIDEO_MENU_ROW_FPS 4
+#define OOT_PSP_VIDEO_MENU_ROW_APPLY 5
+#define OOT_PSP_VIDEO_MENU_ROW_SAVE 6
+#define OOT_PSP_VIDEO_MENU_ROW_RESET 7
+#define OOT_PSP_VIDEO_MENU_ROW_BACK 8
+#define OOT_PSP_VIDEO_MENU_ROW_COUNT 9
 
 #define OOT_PSP_HOME_MENU_INPUT_LOCKOUT_US 500000
 #define OOT_PSP_HOME_MENU_INPUT_DEBOUNCE_US 150000
@@ -95,20 +98,24 @@ static int OotPspHomeMenu_ControlDeadzoneRow(void) {
     return OotPspControls_GetBindingCount();
 }
 
-static int OotPspHomeMenu_ControlSaveRow(void) {
+static int OotPspHomeMenu_ControlN64StickScalingRow(void) {
     return OotPspControls_GetBindingCount() + 1;
 }
 
-static int OotPspHomeMenu_ControlResetRow(void) {
+static int OotPspHomeMenu_ControlSaveRow(void) {
     return OotPspControls_GetBindingCount() + 2;
 }
 
-static int OotPspHomeMenu_ControlBackRow(void) {
+static int OotPspHomeMenu_ControlResetRow(void) {
     return OotPspControls_GetBindingCount() + 3;
 }
 
-static int OotPspHomeMenu_ControlRowCount(void) {
+static int OotPspHomeMenu_ControlBackRow(void) {
     return OotPspControls_GetBindingCount() + 4;
+}
+
+static int OotPspHomeMenu_ControlRowCount(void) {
+    return OotPspControls_GetBindingCount() + 5;
 }
 
 static void OotPspHomeMenu_SetStatus(const char* message) {
@@ -134,6 +141,8 @@ static void OotPspHomeMenu_AdjustControlRow(int direction) {
         OotPspControls_CycleBinding(sControlSelectedIndex, direction);
     } else if (sControlSelectedIndex == OotPspHomeMenu_ControlDeadzoneRow()) {
         OotPspControls_AdjustDeadzone(direction * 2);
+    } else if (sControlSelectedIndex == OotPspHomeMenu_ControlN64StickScalingRow()) {
+        OotPspControls_SetN64StickScalingEnabled(!OotPspControls_IsN64StickScalingEnabled());
     }
 }
 
@@ -142,6 +151,8 @@ static void OotPspHomeMenu_ActivateControlRow(void) {
         OotPspControls_CycleBinding(sControlSelectedIndex, 1);
     } else if (sControlSelectedIndex == OotPspHomeMenu_ControlDeadzoneRow()) {
         OotPspControls_AdjustDeadzone(2);
+    } else if (sControlSelectedIndex == OotPspHomeMenu_ControlN64StickScalingRow()) {
+        OotPspControls_SetN64StickScalingEnabled(!OotPspControls_IsN64StickScalingEnabled());
     } else if (sControlSelectedIndex == OotPspHomeMenu_ControlSaveRow()) {
         if (OotPspControls_Save() == 0) {
             OotPspHomeMenu_SetStatus("Saved controls.ini");
@@ -176,11 +187,15 @@ static void OotPspHomeMenu_AdjustVideoRow(int direction) {
         OotPspVideo_CycleResolution(direction);
     } else if (sVideoSelectedIndex == OOT_PSP_VIDEO_MENU_ROW_ASPECT) {
         OotPspVideo_CycleAspect(direction);
+    } else if (sVideoSelectedIndex == OOT_PSP_VIDEO_MENU_ROW_FPS) {
+        OotPspVideo_SetFrameRate(OotPspVideo_GetFrameRate() == 20 ? 60 : 20);
+    } else if (sVideoSelectedIndex == OOT_PSP_VIDEO_MENU_ROW_VSYNC) {
+        OotPspVideo_SetVSyncEnabled(!OotPspVideo_IsVSyncEnabled());
     }
 }
 
 static void OotPspHomeMenu_ActivateVideoRow(void) {
-    if (sVideoSelectedIndex <= OOT_PSP_VIDEO_MENU_ROW_ASPECT) {
+    if (sVideoSelectedIndex <= OOT_PSP_VIDEO_MENU_ROW_FPS) {
         OotPspHomeMenu_AdjustVideoRow(1);
     } else if (sVideoSelectedIndex == OOT_PSP_VIDEO_MENU_ROW_APPLY) {
         int result;
@@ -267,7 +282,8 @@ static void OotPspHomeMenu_Render(const char* statusMessage, const Color_RGB8* t
     }
 
     OotPspRenderer_RenderHomeMenu(sSelectedIndex, sScreen, submenuSelectedIndex,
-                                  statusMessage, highlightRed, highlightGreen, highlightBlue);
+                                  statusMessage, highlightRed, highlightGreen, highlightBlue,
+                                  scePowerGetBatteryLifePercent());
 }
 
 void OotPspHomeMenu_PollHomeButton(void) {

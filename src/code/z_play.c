@@ -24,6 +24,7 @@ u8 sMotionBlurStatus;
 #if PLATFORM_PSP
 #include "oot_psp_gfx_ext.h"
 #include "oot_psp_renderer.h"
+#include "oot_psp_frame_interpolation.h"
 #endif
 
 #include "z64bombers_notebook.h"
@@ -388,6 +389,9 @@ Gfx* Play_SetFog(PlayState* this, Gfx* gfx) {
 }
 
 void Play_Destroy(GameState* thisx) {
+#if PLATFORM_PSP
+    OotPspFrameInterpolation_Reset();
+#endif
     PlayState* this = (PlayState*)thisx;
     GraphicsContext* gfxCtx = this->state.gfxCtx;
 
@@ -1107,6 +1111,9 @@ void Play_Update(PlayState* this) {
 }
 
 void Play_PostWorldDraw(PlayState* this) {
+#if PLATFORM_PSP
+    OotPspFrameInterpolation_SetWorldScope(0);
+#endif
     if (IS_PAUSED(&this->pauseCtx)) {
         KaleidoScopeCall_Draw(this);
     }
@@ -1146,6 +1153,43 @@ void Play_PostWorldDraw(PlayState* this) {
         CLOSE_DISPS(gfxCtx);
     }
 }
+
+#if PLATFORM_PSP
+static f32 Play_GetPspPerspectiveNear(PlayState* play) {
+    Camera* camera = GET_ACTIVE_CAM(play);
+    f32 near = play->view.zNear;
+
+    /* Give foreground aiming a smaller GU plane. Keep MM's normal depth
+     * range for gameplay and cutscenes: reducing it globally loses precision
+     * on the intro's overlapping tree surfaces and ground shadows. */
+    if (near <= 1.0f) return near;
+    if (camera != NULL) {
+        switch (camera->mode) {
+            case CAM_MODE_FIRSTPERSON:
+            case CAM_MODE_BOWARROW:
+            case CAM_MODE_SLINGSHOT:
+            case CAM_MODE_BOWARROWZ:
+            case CAM_MODE_DEKUSHOOT:
+                return 1.0f;
+        }
+    }
+    return near;
+}
+
+static void Play_GetPspFogProjection(View* view, f32 originalNear, OotPspFogProjection* fog) {
+    Mtx reference;
+    MtxF referenceF;
+    MtxF currentF;
+
+    /* Use the same Q16 depth coefficients as the submitted projection. FOV
+     * and aspect affect only x/y, so the reference aspect can be one. */
+    guPerspective(&reference, NULL, view->fovy, 1.0f, originalNear, view->zFar, view->scale);
+    Matrix_MtxToMtxF(&reference, &referenceF);
+    Matrix_MtxToMtxF(&view->projection, &currentF);
+    fog->scale = referenceF.mf[3][2] / currentF.mf[3][2];
+    fog->offset = (fog->scale * currentF.mf[2][2] - referenceF.mf[2][2]) / -currentF.mf[2][3];
+}
+#endif
 
 void Play_DrawMain(PlayState* this) {
     GraphicsContext* gfxCtx = this->state.gfxCtx;
@@ -1199,9 +1243,25 @@ void Play_DrawMain(PlayState* this) {
             zFar = 12800.0f;
         }
 
+#if PLATFORM_PSP
+        {
+            f32 savedNear = this->view.zNear;
+            OotPspFogProjection* fogProjection = NULL;
+            View_SetPerspective(&this->view, this->view.fovy, Play_GetPspPerspectiveNear(this), zFar);
+            View_Apply(&this->view, 0xF);
+            if (this->view.zNear != savedNear) {
+                fogProjection = GRAPH_ALLOC(gfxCtx, sizeof(*fogProjection));
+                Play_GetPspFogProjection(&this->view, savedNear, fogProjection);
+            }
+            gOotPspSetFogProjection(POLY_OPA_DISP++, fogProjection);
+            gOotPspSetFogProjection(POLY_XLU_DISP++, fogProjection);
+            gOotPspSetFogProjection(OVERLAY_DISP++, NULL);
+            this->view.zNear = savedNear;
+        }
+#else
         View_SetPerspective(&this->view, this->view.fovy, this->view.zNear, zFar);
-
         View_Apply(&this->view, 0xF);
+#endif
 
         // The billboard matrix temporarily stores the viewing matrix
         Matrix_MtxToMtxF(&this->view.viewing, &this->billboardMtxF);
@@ -1476,7 +1536,12 @@ void Play_Draw(PlayState* this) {
     {
         GraphicsContext* gfxCtx2 = this->state.gfxCtx;
 
-        if (sBombersNotebookOpen) {
+    #if PLATFORM_PSP
+    OotPspFrameInterpolation_SetContext(this->sceneId, this->roomCtx.curRoom.num,
+        this->activeCamId | ((u16)GET_ACTIVE_CAM(this)->setting << 4) | ((u16)GET_ACTIVE_CAM(this)->mode << 12));
+    OotPspFrameInterpolation_SetWorldScope(this->pauseCtx.state == 0 && this->transitionMode == TRANS_MODE_OFF);
+#endif
+    if (sBombersNotebookOpen) {
             if (gSysCfbHiResEnabled != 1) {
                 Sched_FlushTaskQueue();
                 SysCfb_SetHiResMode();
@@ -1509,6 +1574,9 @@ void Play_Draw(PlayState* this) {
     } else {
         Play_DrawMain(this);
     }
+#if PLATFORM_PSP
+    OotPspFrameInterpolation_SetWorldScope(0);
+#endif
 }
 
 void Play_Main(GameState* thisx) {

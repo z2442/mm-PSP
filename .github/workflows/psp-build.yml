@@ -1,0 +1,170 @@
+name: PSP build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: psp-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and package PSP port
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PSPDEV_VERSION: v20261001
+      PSPDEV_SHA256: a86efe624e770005290919617859e9df24bd8fcd3e364f4587f23ec7364b0acd
+      ME_CORE_COMMIT: f153f0de12d42377b4f7ecec7e328dd2f0e825bb
+      ME_CORE_SHA256: db6a0dc592d202d3905478d1dbfd91c428dfab5a5666bcbcdb6ca5a2fbb70d10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install host build dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          # The Makefile checks for MIPS binutils even when building the PSP target.
+          sudo apt-get install --yes --no-install-recommends \
+            binutils-mips-linux-gnu build-essential cmake curl make python3-venv xxd zlib1g-dev
+          mips-linux-gnu-ld --version
+
+      - name: Install PSPDEV
+        shell: bash
+        run: |
+          curl --fail --location --retry 3 \
+            "https://github.com/pspdev/pspdev/releases/download/${PSPDEV_VERSION}/pspdev-ubuntu-latest-x86_64.tar.gz" \
+            --output "${RUNNER_TEMP}/pspdev.tar.gz"
+          echo "${PSPDEV_SHA256}  ${RUNNER_TEMP}/pspdev.tar.gz" | sha256sum --check
+          tar -xzf "${RUNNER_TEMP}/pspdev.tar.gz" -C "${RUNNER_TEMP}"
+          echo "PSPDEV=${RUNNER_TEMP}/pspdev" >> "$GITHUB_ENV"
+          echo "${RUNNER_TEMP}/pspdev/bin" >> "$GITHUB_PATH"
+
+      - name: Install Media Engine library with VME support
+        shell: bash
+        run: |
+          # Match the VME API used by the port; stock PSPDEV's libmecore lacks it.
+          curl --fail --location --retry 3 \
+            "https://github.com/mcidclan/psp-media-engine-custom-core/archive/${ME_CORE_COMMIT}.tar.gz" \
+            --output "${RUNNER_TEMP}/me-core.tar.gz"
+          echo "${ME_CORE_SHA256}  ${RUNNER_TEMP}/me-core.tar.gz" | sha256sum --check
+          mkdir -p "${RUNNER_TEMP}/me-core"
+          tar -xzf "${RUNNER_TEMP}/me-core.tar.gz" -C "${RUNNER_TEMP}/me-core" --strip-components=1
+          cmake -S "${RUNNER_TEMP}/me-core" -B "${RUNNER_TEMP}/me-core/build"
+          cmake --build "${RUNNER_TEMP}/me-core/build" --parallel "$(nproc)"
+          cmake --install "${RUNNER_TEMP}/me-core/build"
+
+      - name: Install Python build dependency
+        shell: bash
+        run: |
+          python3 -m venv .venv
+          # The ROM-independent PSP build only needs PyYAML from requirements.txt.
+          .venv/bin/python3 -m pip install 'PyYAML>=6.0.1,<7.0.0'
+
+      - name: Build with psp.sh
+        shell: bash
+        run: ./psp.sh VERSION=n64-us
+
+      - name: Run PSP host regressions
+        shell: bash
+        run: .venv/bin/python3 tools/run_psp_tests.py
+
+      - name: Create installable archive
+        shell: bash
+        run: |
+          python3 tools/package_psp.py \
+            build/psp-port/n64-us \
+            build/mm-psp-n64-us.zip
+
+      - name: Upload installable archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: mm-psp-build
+          path: build/mm-psp-n64-us.zip
+          # The downloader extracts this wrapper, preserving the installable ZIP.
+          archive: true
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Publish latest PSP build
+    needs: build
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download installable archive
+        uses: actions/download-artifact@v7
+        with:
+          name: mm-psp-build
+          path: release
+
+      - name: Verify release archive
+        shell: bash
+        run: |
+          test -s release/mm-psp-n64-us.zip
+          python3 -m zipfile -t release/mm-psp-n64-us.zip
+
+      - name: Move latest tag to the built commit
+        id: latest
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const repo = context.repo;
+            const { data: branch } = await github.rest.repos.getBranch({
+              ...repo,
+              branch: context.ref.slice('refs/heads/'.length),
+            });
+            // Rerunning an older build must not replace the latest release.
+            if (branch.commit.sha !== context.sha) {
+              core.notice('Skipping release because this build is no longer the branch head.');
+              return;
+            }
+
+            try {
+              await github.rest.git.getRef({ ...repo, ref: 'tags/latest' });
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              await github.rest.git.createRef({
+                ...repo, ref: 'refs/tags/latest', sha: context.sha,
+              });
+              core.setOutput('publish', 'true');
+              return;
+            }
+
+            await github.rest.git.updateRef({
+              ...repo, ref: 'tags/latest', sha: context.sha, force: true,
+            });
+            core.setOutput('publish', 'true');
+
+      - name: Publish rolling prerelease
+        if: steps.latest.outputs.publish == 'true'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: latest
+          name: mm-PSP
+          prerelease: true
+          target_commitish: ${{ github.sha }}
+          files: release/mm-psp-n64-us.zip
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          body: |
+            Automated PSP build from the latest `${{ github.event.repository.default_branch }}` branch.
+
+            Commit: ${{ github.sha }}
+            Build: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            Extract the ZIP and copy `MM_PSP` into `PSP/GAME` on your Memory Stick or PSP Go internal storage.
+            See `MM_PSP/README.txt` for installation instructions. A ROM is not included.
